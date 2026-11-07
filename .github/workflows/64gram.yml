@@ -104,7 +104,9 @@ jobs:
           git -C upstream fetch origin "$AUDITED_REF"
           git -C upstream fetch origin "$NEW_REF"
 
-          first_line_old=$(git -C upstream show "$AUDITED_REF:changelog.txt" | head -n 1)
+          # write to a file first: `git show | head` fails under pipefail (SIGPIPE on the large changelog)
+          git -C upstream show "$AUDITED_REF:changelog.txt" > "$RUNNER_TEMP/changelog-old.txt"
+          first_line_old=$(head -n 1 "$RUNNER_TEMP/changelog-old.txt")
           old_ver=$(echo "$first_line_old" | awk '{print $1}')
           if [[ ! "$old_ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "::error::Invalid old base version format: $old_ver"
@@ -112,7 +114,8 @@ jobs:
           fi
           old_base="v$old_ver"
 
-          first_line_new=$(git -C upstream show "$NEW_REF:changelog.txt" | head -n 1)
+          git -C upstream show "$NEW_REF:changelog.txt" > "$RUNNER_TEMP/changelog-new.txt"
+          first_line_new=$(head -n 1 "$RUNNER_TEMP/changelog-new.txt")
           new_ver=$(echo "$first_line_new" | awk '{print $1}')
           if [[ ! "$new_ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "::error::Invalid new base version format: $new_ver"

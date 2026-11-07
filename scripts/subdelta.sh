@@ -23,7 +23,8 @@ mkdir -p "$OUTDIR"
 
 # Validate base version if BASE_REF is omitted
 if [ -z "$BASE_REF" ]; then
-  first_line=$(git -C "$REPO" show "$REF:changelog.txt" 2>/dev/null | head -n 1 || true)
+  # sed reads the whole stream, so git never gets SIGPIPE under pipefail
+  first_line=$(git -C "$REPO" show "$REF:changelog.txt" 2>/dev/null | sed -n '1p' || true)
   base_ver=$(echo "$first_line" | awk '{print $1}')
   ver_regex='^[0-9]+\.[0-9]+(\.[0-9]+)?$'
   if [[ ! "$base_ver" =~ $ver_regex ]]; then
