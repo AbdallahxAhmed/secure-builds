@@ -76,8 +76,14 @@ get_upstream_url() {
 }
 
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+# Cleanup is best effort: a failed rm must never fail the scan.
+trap 'rm -rf "$scratch" 2>/dev/null || true' EXIT
 git init --bare -q "$scratch"
+# git fetch can spawn detached auto-gc/maintenance that keeps writing into
+# objects/ while the EXIT trap deletes it ("Directory not empty"); disable it.
+git -C "$scratch" config gc.auto 0
+git -C "$scratch" config maintenance.auto false
+git -C "$scratch" config fetch.writeCommitGraph false
 
 sha_regex='^[0-9a-f]{40}$'
 
