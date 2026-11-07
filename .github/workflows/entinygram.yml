@@ -431,6 +431,9 @@ jobs:
   sign-release:
     name: Sign and publish release
     needs: [check, build]
+    # Run even when one matrix leg failed: the pluginless APK must not be held
+    # back by the plugins variant. A missing pluginless artifact still fails below.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -449,6 +452,7 @@ jobs:
           path: unsigned-pluginless
 
       - name: Download unsigned plugins APK
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: unsigned-plugins
@@ -498,6 +502,10 @@ jobs:
 
           # 1. Sign pluginless APK
           raw_pluginless=$(find unsigned-pluginless -name "*.apk" | head -n 1)
+          if [ -z "$raw_pluginless" ]; then
+            echo "::error::Pluginless APK artifact missing; nothing to publish"
+            exit 1
+          fi
           "$zipalign" -p -f 4 "$raw_pluginless" "$RUNNER_TEMP/aligned-pluginless.apk"
           signed_pluginless="release_apks/entinygram-${NEW_REF}-arm64.apk"
           "$apksigner" sign \
@@ -518,26 +526,30 @@ jobs:
             exit 1
           fi
 
-          # 2. Sign plugins APK
-          raw_plugins=$(find unsigned-plugins -name "*.apk" | head -n 1)
-          "$zipalign" -p -f 4 "$raw_plugins" "$RUNNER_TEMP/aligned-plugins.apk"
-          signed_plugins="release_apks/entinygram-${NEW_REF}-arm64-plugins.apk"
-          "$apksigner" sign \
-            --ks "$RUNNER_TEMP/release.p12" \
-            --ks-type PKCS12 \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:KS_PASS \
-            --key-pass env:KS_PASS \
-            --out "$signed_plugins" \
-            "$RUNNER_TEMP/aligned-plugins.apk"
+          # 2. Sign plugins APK (optional: publish pluginless alone if this variant failed)
+          raw_plugins=$(find unsigned-plugins -name "*.apk" 2>/dev/null | head -n 1 || true)
+          if [ -z "$raw_plugins" ]; then
+            echo "::warning::Plugins APK missing (its build failed); publishing the pluginless APK only"
+          else
+            "$zipalign" -p -f 4 "$raw_plugins" "$RUNNER_TEMP/aligned-plugins.apk"
+            signed_plugins="release_apks/entinygram-${NEW_REF}-arm64-plugins.apk"
+            "$apksigner" sign \
+              --ks "$RUNNER_TEMP/release.p12" \
+              --ks-type PKCS12 \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KS_PASS \
+              --key-pass env:KS_PASS \
+              --out "$signed_plugins" \
+              "$RUNNER_TEMP/aligned-plugins.apk"
 
-          # Verify plugins
-          certs_plugins=$("$apksigner" verify --print-certs "$signed_plugins")
-          echo "$certs_plugins"
-          fp_plugins=$(echo "$certs_plugins" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-          if [ "$fp_plugins" != "$expected_digest" ]; then
-            echo "::error::Plugins Signer #1 SHA-256 digest mismatch! Expected $expected_digest, got $fp_plugins"
-            exit 1
+            # Verify plugins
+            certs_plugins=$("$apksigner" verify --print-certs "$signed_plugins")
+            echo "$certs_plugins"
+            fp_plugins=$(echo "$certs_plugins" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            if [ "$fp_plugins" != "$expected_digest" ]; then
+              echo "::error::Plugins Signer #1 SHA-256 digest mismatch! Expected $expected_digest, got $fp_plugins"
+              exit 1
+            fi
           fi
 
       - name: Wipe keystore
@@ -566,7 +578,11 @@ jobs:
             echo ""
             echo "### Which APK to choose"
             echo "- **\`entinygram-${NEW_REF}-arm64.apk\` (Recommended)**: Standard pluginless release for arm64 devices. Recommended for almost all users."
-            echo "- **\`entinygram-${NEW_REF}-arm64-plugins.apk\`**: Includes plugin engine support. Warning: When plugins are enabled, they run unsigned third-party plugin code with full access to messages and chat data. Plugins are disabled by default."
+            if [ -f "release_apks/entinygram-${NEW_REF}-arm64-plugins.apk" ]; then
+              echo "- **\`entinygram-${NEW_REF}-arm64-plugins.apk\`**: Includes plugin engine support. Warning: When plugins are enabled, they run unsigned third-party plugin code with full access to messages and chat data. Plugins are disabled by default."
+            else
+              echo "- The plugins variant failed to build for this version, so only the pluginless APK is published."
+            fi
             echo ""
             echo "### Hardened defaults"
             echo "This rebuild enforces hardened defaults:"
@@ -589,8 +605,7 @@ jobs:
           gh release create "entinygram-${NEW_REF}" \
             --title "EntinyGram ${NEW_REF}" \
             --notes-file release_notes.md \
-            release_apks/"entinygram-${NEW_REF}-arm64.apk" \
-            release_apks/"entinygram-${NEW_REF}-arm64-plugins.apk" \
+            release_apks/*.apk \
             release_apks/SHA256SUMS \
             scan-report.md
 
