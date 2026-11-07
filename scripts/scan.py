@@ -40,7 +40,9 @@ ensure_blobs_present()); no network access is made for local test repos.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -57,7 +59,7 @@ MAX_ITEMS_1 = 60           # max report entries for hosts
 MAX_ITEMS_2 = 40           # max report entries for other sections
 MAX_LOG_LINES = 20         # subjects shown in the informational section
 
-PROFILES = ("android-patchset", "apktool")
+PROFILES = ("android-patchset", "apktool", "tdesktop-fork")
 
 # glob list is checked with fullmatch (see glob_to_regex)
 # Changes under these globs block the build (needs review).
@@ -80,6 +82,21 @@ PROFILE_GLOBS: dict[str, list[str]] = {
         "smali*/**/net/**",
         "smali*/**/http*/**",
     ],
+    "tdesktop-fork": [
+        "Telegram/SourceFiles/core/update_checker.*",
+        "Telegram/SourceFiles/mtproto/**",
+        "Telegram/SourceFiles/storage/**",
+        "Telegram/SourceFiles/main/**",
+        "Telegram/SourceFiles/export/**",
+        "Telegram/SourceFiles/config.h",
+        "Telegram/SourceFiles/lang/**",
+        "Telegram/Resources/update/**",
+        "Telegram/CMakeLists.txt",
+        "Telegram/cmake/**",
+        "Telegram/build/**",
+        ".github/**",
+        ".gitmodules",
+    ],
 }
 
 # Changes under these globs are listed in the report but do not block.
@@ -98,6 +115,7 @@ PROFILE_INFO_GLOBS: dict[str, list[str]] = {
         "upstream-commit",
     ],
     "apktool": [],
+    "tdesktop-fork": [],
 }
 
 GREP_TEXT_EXTS = {  # never treat such blobs as corpus text
@@ -186,6 +204,34 @@ def ls_tree(repo: str, rev: str) -> dict[str, str]:
         if otype == "blob" and path:
             files[path] = oid
     return files
+
+
+def ls_submodules(repo: str, rev: str) -> dict[str, str]:
+    """path -> commit SHA map of submodules at rev."""
+    subs: dict[str, str] = {}
+    out = git(repo, "ls-tree", "-r", "-z", rev).decode("utf-8", "replace")
+    for rec in out.split("\0"):
+        if not rec:
+            continue
+        meta, _, path = rec.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "commit" and path:
+            subs[path] = parts[2]
+    return subs
+
+
+def normalize_diff(diff_text: str) -> str:
+    """Reduce a diff to what the fork itself changed: file headers plus
+    added/removed lines. Index lines, `diff --git` lines, hunk headers and
+    context lines are dropped, because they shift whenever upstream edits
+    nearby code even though the fork's own change is identical."""
+    lines = []
+    for line in diff_text.splitlines():
+        if line.startswith(("+++ ", "--- ")):
+            lines.append(line)
+        elif line.startswith(("+", "-")):
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def diff_name_status(repo: str, old: str, new: str) -> dict[str, str]:
@@ -643,9 +689,18 @@ def top_level_dirs(files: dict[str, str]) -> set[str]:
 
 
 def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
-             tracker_file: str) -> ScanResult:
+             tracker_file: str,
+             base_old_ref: str | None = None,
+             base_new_ref: str | None = None,
+             subs_old_dir: str | None = None,
+             subs_new_dir: str | None = None) -> ScanResult:
     old_rev = resolve_ref(repo, old_ref)
     new_rev = resolve_ref(repo, new_ref)
+
+    base_old_rev = resolve_ref(repo, base_old_ref) if base_old_ref else None
+    base_new_rev = resolve_ref(repo, base_new_ref) if base_new_ref else None
+    if profile == "tdesktop-fork" and (not base_old_rev or not base_new_rev):
+        raise ScanError("profile 'tdesktop-fork' requires --base-old and --base-new")
 
     with open(tracker_file, "r", encoding="utf-8") as fh:
         tracker_data = json.load(fh)
@@ -655,6 +710,8 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
 
     old_tree = load_tree(repo, old_rev)
     new_tree = load_tree(repo, new_rev)
+    base_old_tree = load_tree(repo, base_old_rev) if base_old_rev else None
+    base_new_tree = load_tree(repo, base_new_rev) if base_new_rev else None
     changes = diff_name_status(repo, old_rev, new_rev)
     git_binaries = diff_numstat(repo, old_rev, new_rev)
 
@@ -664,7 +721,14 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
     # ---- 1. network hosts -----------------------------------------------------
     old_hosts, _ = collect_hosts(old_tree)
     new_hosts, new_examples = collect_hosts(new_tree)
-    fresh_hosts = sorted(new_hosts - old_hosts)[:MAX_ITEMS_1]
+    if profile == "tdesktop-fork" and base_new_tree is not None:
+        base_new_hosts, _ = collect_hosts(base_new_tree)
+        fresh_hosts = sorted((new_hosts - old_hosts) - base_new_hosts)[:MAX_ITEMS_1]
+        upstream_hosts = sorted((new_hosts - old_hosts) & base_new_hosts)
+        for host in upstream_hosts:
+            sec_info.add("- [info] Upstream host added by official Telegram in BASE-NEW: `%s`" % host)
+    else:
+        fresh_hosts = sorted(new_hosts - old_hosts)[:MAX_ITEMS_1]
     sec_hosts = Section("1. NEW NETWORK HOSTS")
     for host in fresh_hosts:
         for path, line in new_examples.get(host, [])[:1]:
@@ -678,120 +742,162 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
         sections.append(sec_hosts)
 
     # ---- 2. Android permissions -----------------------------------------------
-    sec_perms = Section("2. ANDROID PERMISSIONS")
-    old_perms: set[str] = set()
-    new_perms: set[str] = set()
-    for path in sorted(new_tree.text):
-        if path.endswith("AndroidManifest.xml"):
-            new_perms |= manifest_permissions(new_tree.text_of(path))
-    for path in sorted(old_tree.text):
-        if path.endswith("AndroidManifest.xml"):
-            old_perms |= manifest_permissions(old_tree.text_of(path))
-    # added lines of changed *.patch files
-    patch_perm_hits: list[tuple[str, set[str]]] = []
-    changed_patches = sorted(
-        p for p, st in changes.items() if p.endswith(".patch") and st in "AM")
-    for path in changed_patches:
-        for delta_line in diff_side_lines(repo, old_rev, new_rev, path,
-                                          side="new"):
-            perms = manifest_permissions(delta_line)
-            if perms:
-                patch_perm_hits.append((path, perms))
-                new_perms |= perms
-    # baseline: every *.patch file in OLD counts as already present
-    for path in sorted(p for p in old_tree.files if p.endswith(".patch")):
-        old_perms |= manifest_permissions(old_tree.text_of(path))
-    added_perms = sorted(new_perms - old_perms)
-    if profile == "apktool":
-        internet = "android.permission.INTERNET"
-        # Requested in a manifest: always critical, whatever OLD had.
-        requested = sorted(
-            p for p in new_tree.text
-            if file_basename(p) == "AndroidManifest.xml"
-            and internet in manifest_permissions(new_tree.text[p]))
-        # Mentioned as text elsewhere: Google's own smali already names the
-        # permission as a string constant, so only an increase is suspicious.
-        def mentions(tree: Tree) -> int:
-            return sum(tree.text_of(p).count(internet) for p in tree.text
-                       if file_basename(p) != "AndroidManifest.xml")
-        old_mentions, new_mentions = mentions(old_tree), mentions(new_tree)
-        if requested:
-            sec_perms.is_critical = True
-            sec_perms.add(
-                "`%s` is REQUESTED in the NEW manifest. A decompiled keyboard "
-                "gaining network access must always be reviewed by a human."
-                % internet)
-            for p in requested:
-                sec_perms.add("  - `%s`" % p)
-        elif new_mentions > old_mentions:
-            sec_perms.is_critical = True
-            sec_perms.add(
-                "`%s` mentioned %d -> %d time(s) outside the manifest; new "
-                "code references the network permission." %
-                (internet, old_mentions, new_mentions))
-            for p in sorted(p for p in new_tree.text
-                            if internet in new_tree.text[p])[:5]:
-                sec_perms.add("  - `%s`" % p)
-    if added_perms:
-        if not sec_perms.is_critical:
-            sec_perms.add(
-                "New permission(s), not present in the OLD ref: %s"
-                % ", ".join("`%s`" % p for p in added_perms))
-        for path, perms in patch_perm_hits:
-            if perms & set(added_perms):
-                sec_perms.add("- in `%s` (patch file)" % path)
+    if profile in ("android-patchset", "apktool"):
+        sec_perms = Section("2. ANDROID PERMISSIONS")
+        old_perms: set[str] = set()
+        new_perms: set[str] = set()
         for path in sorted(new_tree.text):
             if path.endswith("AndroidManifest.xml"):
-                found = manifest_permissions(new_tree.text_of(path)) & set(added_perms)
-                if found:
-                    sec_perms.add("- in `%s`" % path)
-    if not sec_perms.empty():
-        sections.append(sec_perms)
+                new_perms |= manifest_permissions(new_tree.text_of(path))
+        for path in sorted(old_tree.text):
+            if path.endswith("AndroidManifest.xml"):
+                old_perms |= manifest_permissions(old_tree.text_of(path))
+        # added lines of changed *.patch files
+        patch_perm_hits: list[tuple[str, set[str]]] = []
+        changed_patches = sorted(
+            p for p, st in changes.items() if p.endswith(".patch") and st in "AM")
+        for path in changed_patches:
+            for delta_line in diff_side_lines(repo, old_rev, new_rev, path,
+                                              side="new"):
+                perms = manifest_permissions(delta_line)
+                if perms:
+                    patch_perm_hits.append((path, perms))
+                    new_perms |= perms
+        # baseline: every *.patch file in OLD counts as already present
+        for path in sorted(p for p in old_tree.files if p.endswith(".patch")):
+            old_perms |= manifest_permissions(old_tree.text_of(path))
+        added_perms = sorted(new_perms - old_perms)
+        if profile == "apktool":
+            internet = "android.permission.INTERNET"
+            # Requested in a manifest: always critical, whatever OLD had.
+            requested = sorted(
+                p for p in new_tree.text
+                if file_basename(p) == "AndroidManifest.xml"
+                and internet in manifest_permissions(new_tree.text[p]))
+            # Mentioned as text elsewhere: Google's own smali already names the
+            # permission as a string constant, so only an increase is suspicious.
+            def mentions(tree: Tree) -> int:
+                return sum(tree.text_of(p).count(internet) for p in tree.text
+                           if file_basename(p) != "AndroidManifest.xml")
+            old_mentions, new_mentions = mentions(old_tree), mentions(new_tree)
+            if requested:
+                sec_perms.is_critical = True
+                sec_perms.add(
+                    "`%s` is REQUESTED in the NEW manifest. A decompiled keyboard "
+                    "gaining network access must always be reviewed by a human."
+                    % internet)
+                for p in requested:
+                    sec_perms.add("  - `%s`" % p)
+            elif new_mentions > old_mentions:
+                sec_perms.is_critical = True
+                sec_perms.add(
+                    "`%s` mentioned %d -> %d time(s) outside the manifest; new "
+                    "code references the network permission." %
+                    (internet, old_mentions, new_mentions))
+                for p in sorted(p for p in new_tree.text
+                                if internet in new_tree.text[p])[:5]:
+                    sec_perms.add("  - `%s`" % p)
+        if added_perms:
+            if not sec_perms.is_critical:
+                sec_perms.add(
+                    "New permission(s), not present in the OLD ref: %s"
+                    % ", ".join("`%s`" % p for p in added_perms))
+            for path, perms in patch_perm_hits:
+                if perms & set(added_perms):
+                    sec_perms.add("- in `%s` (patch file)" % path)
+            for path in sorted(new_tree.text):
+                if path.endswith("AndroidManifest.xml"):
+                    found = manifest_permissions(new_tree.text_of(path)) & set(added_perms)
+                    if found:
+                        sec_perms.add("- in `%s`" % path)
+        if not sec_perms.empty():
+            sections.append(sec_perms)
 
     # ---- 3. trackers ------------------------------------------------------------
-    sec_track = Section("3. TRACKERS")
-    pattern, groups, warns = build_tracker_matcher(tracker_data["trackers"])
-    if pattern is not None:
-        changed_paths = set(changes)
-        old_counts, _ = count_tracker_hits(pattern, groups, old_tree,
-                                           changed_paths)
-        new_counts, file_hits = count_tracker_hits(pattern, groups, new_tree,
-                                                   changed_paths)
-        for key in sorted(new_counts):
-            hits_old = old_counts.get(key, 0)
-            hits_new = new_counts[key]
-            if hits_new > hits_old:
-                name, kind = key
-                sec_track.add(
-                    "- %s (%s): %d -> %d match(es)%s"
-                    % (name, kind, hits_old, hits_new,
-                       ", in: " + ", ".join("`%s`" % p for p in
-                                            sorted(file_hits.get(key, set()))[:3])
-                       if file_hits.get(key) else ""))
-    if not sec_track.empty():
-        sections.append(sec_track)
-    for warn in warns:
-        sec_info.add("[warn] %s" % warn)
+    if profile in ("android-patchset", "apktool"):
+        sec_track = Section("3. TRACKERS")
+        pattern, groups, warns = build_tracker_matcher(tracker_data["trackers"])
+        if pattern is not None:
+            changed_paths = set(changes)
+            old_counts, _ = count_tracker_hits(pattern, groups, old_tree,
+                                               changed_paths)
+            new_counts, file_hits = count_tracker_hits(pattern, groups, new_tree,
+                                                       changed_paths)
+            for key in sorted(new_counts):
+                hits_old = old_counts.get(key, 0)
+                hits_new = new_counts[key]
+                if hits_new > hits_old:
+                    name, kind = key
+                    sec_track.add(
+                        "- %s (%s): %d -> %d match(es)%s"
+                        % (name, kind, hits_old, hits_new,
+                           ", in: " + ", ".join("`%s`" % p for p in
+                                                sorted(file_hits.get(key, set()))[:3])
+                           if file_hits.get(key) else ""))
+        if not sec_track.empty():
+            sections.append(sec_track)
+        for warn in warns:
+            sec_info.add("[warn] %s" % warn)
 
     # ---- 4. dependencies --------------------------------------------------------
     sec_deps = Section("4. DEPENDENCIES")
-    for path in sorted(p for p, st in changes.items()
-                       if st in "AMD" and is_dep_file(p)):
-        removed = diff_side_lines(repo, old_rev, new_rev, path, side="old")
-        added = diff_side_lines(repo, old_rev, new_rev, path, side="new")
-        if path.endswith("CMakeLists.txt"):
-            added = [l for l in added if CMAKE_DEP_RE.search(l)]
-            removed = [l for l in removed if CMAKE_DEP_RE.search(l)]
-        if not added and not removed:
-            continue
-        sec_deps.add("`%s` (%s)" % (path, STATUS_NAME.get(changes[path], "changed")))
-        for line in added[:10]:
-            sec_deps.add("  + `%s`" % snippet(line))
-        for line in removed[:10]:
-            sec_deps.add("  - `%s`" % snippet(line))
-        if len(added) + len(removed) > 20:
-            sec_deps.add("  (%d more lines omitted)"
-                         % (len(added) + len(removed) - 20))
+    if profile == "tdesktop-fork":
+        if base_old_rev and base_new_rev and base_old_tree and base_new_tree:
+            all_dep_paths = sorted({
+                p for p in set(changes) | set(new_tree.files) | set(base_new_tree.files)
+                if is_dep_file(p)
+            })
+            for path in all_dep_paths:
+                if new_tree.files.get(path) == base_new_tree.files.get(path):
+                    continue
+                diff_old = git_text(repo, "diff", "--no-color", "--no-renames",
+                                    base_old_rev, old_rev, "--", path)
+                diff_new = git_text(repo, "diff", "--no-color", "--no-renames",
+                                    base_new_rev, new_rev, "--", path)
+                norm_old = normalize_diff(diff_old)
+                norm_new = normalize_diff(diff_new)
+                if norm_old != norm_new:
+                    added = diff_side_lines(repo, base_new_rev, new_rev, path, side="new")
+                    removed = diff_side_lines(repo, base_new_rev, new_rev, path, side="old")
+                    if path.endswith("CMakeLists.txt"):
+                        added = [l for l in added if CMAKE_DEP_RE.search(l)]
+                        removed = [l for l in removed if CMAKE_DEP_RE.search(l)]
+                    old_added = set(diff_side_lines(repo, base_old_rev, old_rev, path, side="new"))
+                    old_removed = set(diff_side_lines(repo, base_old_rev, old_rev, path, side="old"))
+                    if path.endswith("CMakeLists.txt"):
+                        old_added = {l for l in old_added if CMAKE_DEP_RE.search(l)}
+                        old_removed = {l for l in old_removed if CMAKE_DEP_RE.search(l)}
+                    delta_added = [l for l in added if l not in old_added]
+                    delta_removed = [l for l in removed if l not in old_removed]
+                    if delta_added or delta_removed:
+                        sec_deps.add("`%s` (fork delta changed)" % path)
+                        for line in delta_added[:10]:
+                            sec_deps.add("  + `%s`" % snippet(line))
+                        for line in delta_removed[:10]:
+                            sec_deps.add("  - `%s`" % snippet(line))
+                        if len(delta_added) + len(delta_removed) > 20:
+                            sec_deps.add("  (%d more lines omitted)"
+                                         % (len(delta_added) + len(delta_removed) - 20))
+                    else:
+                        sec_deps.add("`%s` (fork delta changed)" % path)
+    else:
+        for path in sorted(p for p, st in changes.items()
+                           if st in "AMD" and is_dep_file(p)):
+            removed = diff_side_lines(repo, old_rev, new_rev, path, side="old")
+            added = diff_side_lines(repo, old_rev, new_rev, path, side="new")
+            if path.endswith("CMakeLists.txt"):
+                added = [l for l in added if CMAKE_DEP_RE.search(l)]
+                removed = [l for l in removed if CMAKE_DEP_RE.search(l)]
+            if not added and not removed:
+                continue
+            sec_deps.add("`%s` (%s)" % (path, STATUS_NAME.get(changes[path], "changed")))
+            for line in added[:10]:
+                sec_deps.add("  + `%s`" % snippet(line))
+            for line in removed[:10]:
+                sec_deps.add("  - `%s`" % snippet(line))
+            if len(added) + len(removed) > 20:
+                sec_deps.add("  (%d more lines omitted)"
+                             % (len(added) + len(removed) - 20))
     if not sec_deps.empty():
         sections.append(sec_deps)
 
@@ -810,7 +916,11 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
         if st not in "AM":
             continue
         is_bin = is_flagged_binary(path) or git_binaries.get(path, False)
-        if profile == "apktool" and path.startswith(("res/", "assets/")):
+        if profile == "tdesktop-fork":
+            if is_bin and base_new_tree is not None:
+                if new_tree.files.get(path) != base_new_tree.files.get(path):
+                    flagged_bins.append(path)
+        elif profile == "apktool" and path.startswith(("res/", "assets/")):
             if path.startswith("lib/") and path.endswith(".so"):
                 flagged_bins.append(path)
             else:
@@ -831,18 +941,39 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
     sec_sensitive = Section("6. SENSITIVE PATHS")
     sensitive = [glob_to_regex(g) for g in PROFILE_GLOBS[profile]]
     watched = [glob_to_regex(g) for g in PROFILE_INFO_GLOBS.get(profile, [])]
-    for path, st in sorted(changes.items()):
-        if is_sensitive_path(path, sensitive):
-            sec_sensitive.add("`%s` changed (%s)" % (path, STATUS_NAME.get(st, st)))
-        elif is_sensitive_path(path, watched):
-            sec_info.add("[watched] `%s` changed (%s)"
-                         % (path, STATUS_NAME.get(st, st)))
+    if profile == "tdesktop-fork":
+        if base_old_rev and base_new_rev and base_old_tree and base_new_tree:
+            candidate_paths = sorted({
+                p for p in set(new_tree.files) | set(base_new_tree.files)
+                if is_sensitive_path(p, sensitive)
+            })
+            for path in candidate_paths:
+                new_differs = (new_tree.files.get(path) != base_new_tree.files.get(path))
+                if not new_differs:
+                    continue
+                old_differs = (old_tree.files.get(path) != base_old_tree.files.get(path))
+                if not old_differs:
+                    sec_sensitive.add("`%s` changed (new fork delta)" % path)
+                else:
+                    diff_old = git_text(repo, "diff", "--no-color", "--no-renames",
+                                        base_old_rev, old_rev, "--", path)
+                    diff_new = git_text(repo, "diff", "--no-color", "--no-renames",
+                                        base_new_rev, new_rev, "--", path)
+                    if normalize_diff(diff_old) != normalize_diff(diff_new):
+                        sec_sensitive.add("`%s` changed (fork delta modified)" % path)
+    else:
+        for path, st in sorted(changes.items()):
+            if is_sensitive_path(path, sensitive):
+                sec_sensitive.add("`%s` changed (%s)" % (path, STATUS_NAME.get(st, st)))
+            elif is_sensitive_path(path, watched):
+                sec_info.add("[watched] `%s` changed (%s)"
+                             % (path, STATUS_NAME.get(st, st)))
     if not sec_sensitive.empty():
         sections.append(sec_sensitive)
 
-    # ---- 7. buildability (apktool) -------------------------------------------------
-    sec_build = Section("7. BUILDABILITY (apktool)")
+    # ---- 7. buildability / submodules ----------------------------------------------
     if profile == "apktool":
+        sec_build = Section("7. BUILDABILITY (apktool)")
         missing = [n for n in ("AndroidManifest.xml", "apktool.yml")
                    if n not in new_tree.files]
         if missing:
@@ -851,10 +982,81 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
                           "cannot build this version (the decompiled project "
                           "was damaged or a wizard is not configured?)."
                           % "`, `".join(missing))
-    if not sec_build.empty():
-        sections.append(sec_build)
+        if not sec_build.empty():
+            sections.append(sec_build)
+    elif profile == "tdesktop-fork":
+        sec_subs = Section("7. SUBMODULE FORK DELTAS")
+        if subs_old_dir and subs_new_dir:
+            from pathlib import Path
+            p_old = Path(subs_old_dir)
+            p_new = Path(subs_new_dir)
+            diff_names = set()
+            if p_new.is_dir():
+                diff_names |= {f.name for f in p_new.iterdir() if f.name.endswith(".diff")}
+            if p_old.is_dir():
+                diff_names |= {f.name for f in p_old.iterdir() if f.name.endswith(".diff")}
+
+            base_new_hosts_set = collect_hosts(base_new_tree)[0] if base_new_tree else set()
+
+            for fname in sorted(diff_names):
+                sub_name = fname[:-5]
+                f_old = p_old / fname
+                f_new = p_new / fname
+                text_old = f_old.read_text(encoding="utf-8", errors="replace") if f_old.is_file() else ""
+                text_new = f_new.read_text(encoding="utf-8", errors="replace") if f_new.is_file() else ""
+                norm_old = normalize_diff(text_old)
+                norm_new = normalize_diff(text_new)
+
+                if norm_old != norm_new:
+                    lines_old = [line + "\n" for line in norm_old.splitlines()]
+                    lines_new = [line + "\n" for line in norm_new.splitlines()]
+                    udiff = list(difflib.unified_diff(
+                        lines_old, lines_new,
+                        fromfile=f"{sub_name} (old delta)",
+                        tofile=f"{sub_name} (new delta)",
+                    ))
+                    if len(udiff) > 400:
+                        udiff = udiff[:400] + ["\n... [truncated to 400 lines]\n"]
+                    sec_subs.add(f"Submodule `{sub_name}` fork delta changed:\n```diff\n" + "".join(udiff).strip() + "\n```")
+
+                # New hosts in added lines of submodule delta
+                added_lines = [
+                    line[1:] for line in text_new.splitlines()
+                    if line.startswith("+") and not line.startswith("+++")
+                ]
+                old_added_lines = [
+                    line[1:] for line in text_old.splitlines()
+                    if line.startswith("+") and not line.startswith("+++")
+                ]
+                old_delta_hosts = set()
+                for line in old_added_lines:
+                    for m in HOST_RE.finditer(line):
+                        h = normalize_host(m.group(1))
+                        if h and not host_ignored(h):
+                            old_delta_hosts.add(h)
+
+                sub_fresh_hosts: dict[str, str] = {}
+                for line in added_lines:
+                    for m in HOST_RE.finditer(line):
+                        h = normalize_host(m.group(1))
+                        if not h or host_ignored(h):
+                            continue
+                        if h not in old_delta_hosts and h not in old_hosts and h not in base_new_hosts_set:
+                            if h not in sub_fresh_hosts:
+                                sub_fresh_hosts[h] = line
+
+                for host, line in sorted(sub_fresh_hosts.items()):
+                    sec_subs.add(f"- New host in submodule `{sub_name}` fork delta: `{host}`:\n  `{snippet(line)}`")
+
+        if not sec_subs.empty():
+            sections.append(sec_subs)
 
     # ---- 8. informational ----------------------------------------------------------
+    if profile == "tdesktop-fork":
+        if base_old_ref and base_new_ref:
+            sec_info.add("Official Telegram Desktop base: `%s` -> `%s`" % (base_old_ref, base_new_ref))
+
+    max_log = 50 if profile == "tdesktop-fork" else MAX_LOG_LINES
     commit_count = git_text(repo, "rev-list", "--count",
                             f"{old_rev}..{new_rev}").strip()
     sec_info.add("Commits between `%s` and `%s`: %s"
@@ -862,14 +1064,24 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
     subjects = [s for s in git_text(
         repo, "log", "--format=%s", f"{old_rev}..{new_rev}").splitlines() if s]
     if subjects:
-        sec_info.add("Commit subjects (first %d):" % MAX_LOG_LINES)
-        for s in subjects[:MAX_LOG_LINES]:
+        sec_info.add("Commit subjects (first %d):" % max_log)
+        for s in subjects[:max_log]:
             sec_info.add("  - " + s)
-        if len(subjects) > MAX_LOG_LINES:
-            sec_info.add("  - ... (%d more)" % (len(subjects) - MAX_LOG_LINES))
+        if len(subjects) > max_log:
+            sec_info.add("  - ... (%d more)" % (len(subjects) - max_log))
     sec_info.add("Files changed between `%s` and `%s`: %d"
                  % (old_ref, new_ref, len(changes)))
-    if profile == "android-patchset":
+
+    if profile == "tdesktop-fork":
+        old_subs = ls_submodules(repo, old_rev)
+        new_subs = ls_submodules(repo, new_rev)
+        all_subs = sorted(set(old_subs) | set(new_subs))
+        for sub_path in all_subs:
+            o_pin = old_subs.get(sub_path, "<none>")
+            n_pin = new_subs.get(sub_path, "<none>")
+            if o_pin != n_pin:
+                sec_info.add("Submodule `%s` pin: `%s` -> `%s`" % (sub_path, o_pin, n_pin))
+    elif profile == "android-patchset":
         old_up = (blob_text(repo, old_rev, "upstream-commit")
                   if "upstream-commit" in old_tree.files else b"")
         new_up = (blob_text(repo, new_rev, "upstream-commit")
@@ -926,6 +1138,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="markdown report output path")
     parser.add_argument("--json", dest="json_path", metavar="OUT_JSON",
                         help="optional JSON report output path")
+    parser.add_argument("--base-old",
+                        help="official tdesktop base ref for OLD (profile tdesktop-fork)")
+    parser.add_argument("--base-new",
+                        help="official tdesktop base ref for NEW (profile tdesktop-fork)")
+    parser.add_argument("--subs-old",
+                        help="directory of per-submodule fork-only diff files for OLD")
+    parser.add_argument("--subs-new",
+                        help="directory of per-submodule fork-only diff files for NEW")
     return parser.parse_args(argv)
 
 
@@ -933,7 +1153,11 @@ def main(argv: list[str]) -> int:
     try:
         args = parse_args(argv)
         result = run_scan(args.repo, args.old, args.new, args.profile,
-                          args.trackers)
+                          args.trackers,
+                          base_old_ref=args.base_old,
+                          base_new_ref=args.base_new,
+                          subs_old_dir=args.subs_old,
+                          subs_new_dir=args.subs_new)
     except ScanError as exc:
         print("scan error: %s" % exc, file=sys.stderr)
         return EXIT_ERROR
