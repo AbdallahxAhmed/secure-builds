@@ -1,0 +1,633 @@
+name: EntinyGram
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      approve_ref:
+        description: 'A tag a human reviewed; skips the gate for exactly that ref'
+        required: false
+        type: string
+      force_build:
+        description: 'Force build even if ref already built'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: entinygram
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream updates
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      new_ref: ${{ steps.check_ref.outputs.new_ref }}
+      audited_ref: ${{ steps.check_ref.outputs.audited_ref }}
+      proceed: ${{ steps.check_ref.outputs.proceed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check upstream ref and state
+        id: check_ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          audited_ref=""
+          built_ref=""
+          if [ -f state/entinygram.json ]; then
+            audited_ref=$(jq -r '.audited_ref // ""' state/entinygram.json)
+            built_ref=$(jq -r '.built_ref // ""' state/entinygram.json)
+          fi
+
+          if [ -n "$APPROVE_REF" ]; then
+            new_ref="$APPROVE_REF"
+          else
+            new_ref=$(gh api repos/Entaytion/EntinyGram/releases/latest --jq .tag_name)
+          fi
+
+          if [[ ! "$new_ref" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+            echo "::error::Invalid new_ref format: $new_ref"
+            exit 1
+          fi
+
+          proceed="false"
+          if [ "$new_ref" != "$built_ref" ] || [ "$FORCE_BUILD" = "true" ] || [ -n "$APPROVE_REF" ]; then
+            proceed="true"
+          fi
+
+          echo "new_ref=$new_ref" >> "$GITHUB_OUTPUT"
+          echo "audited_ref=$audited_ref" >> "$GITHUB_OUTPUT"
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan upstream changes
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      gate: ${{ steps.eval_gate.outputs.gate }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Clone upstream and run scanner
+        id: run_scan
+        env:
+          AUDITED_REF: ${{ needs.check.outputs.audited_ref }}
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/Entaytion/EntinyGram upstream
+          git -C upstream fetch --tags
+
+          rc=0
+          python3 scripts/scan.py \
+            --repo upstream \
+            --old "$AUDITED_REF" \
+            --new "$NEW_REF" \
+            --profile android-patchset \
+            --trackers data/exodus-trackers.json \
+            --report report.md \
+            --json report.json || rc=$?
+
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Upload scan report artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: scan-report
+          path: |
+            report.md
+            report.json
+          if-no-files-found: ignore
+
+      - name: Evaluate scan results
+        id: eval_gate
+        env:
+          RC: ${{ steps.run_scan.outputs.rc }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$RC" -eq 2 ]; then
+            echo "::error::Scanner failed with usage or internal error (exit code 2)"
+            exit 2
+          fi
+
+          if [ "$RC" -ne 0 ] && [ "$RC" -ne 10 ]; then
+            echo "::error::Scanner failed with unexpected exit code $RC"
+            exit "$RC"
+          fi
+
+          if [ "$RC" -eq 10 ] && [ "$APPROVE_REF" != "$NEW_REF" ]; then
+            gh label create needs-review --description "Requires manual review" || true
+
+            target_title="EntinyGram $NEW_REF needs review"
+            issue_number=$(gh issue list --state open --search "$target_title" --json number,title | jq -r --arg target "$target_title" '.[] | select(.title == $target) | .number' | head -n 1)
+
+            head -c 60000 report.md > issue_body.md
+            printf "\n\n---\n[View full scan report artifact](%s/%s/actions/runs/%s)\n" \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> issue_body.md
+
+            if [ -n "$issue_number" ]; then
+              gh issue edit "$issue_number" --body-file issue_body.md
+            else
+              gh issue create --title "$target_title" --label "needs-review" --body-file issue_body.md
+            fi
+
+            echo "gate=blocked" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.flavour }} (arm64)
+    needs: [check, scan]
+    if: needs.scan.outputs.gate == 'pass'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: [pluginless, plugins]
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Checkout EntinyGram
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Entaytion/EntinyGram
+          ref: ${{ needs.check.outputs.new_ref }}
+          fetch-depth: 0
+
+      - name: Checkout secure-builds scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: secure-builds
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.email ci@entinygram
+          git config --global user.name 'entinygram ci'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      # Must run on the EntinyGram checkout root BEFORE setup: src/fork/InuConfig.kt lives
+      # there, not inside the generated Gradle worktree.
+      - name: Harden EntinyGram defaults
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/secure-builds/scripts/harden_entinygram.py" src/fork
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2
+        with:
+          append-timestamp: true
+          key: ${{ runner.os }}-ndk-27.2-${{ matrix.flavour }}-release
+          restore-keys: |
+            ${{ runner.os }}-ndk-27.2-${{ matrix.flavour }}-release
+            ${{ runner.os }}-ndk-27.2-
+            ${{ runner.os }}-
+          max-size: 5G
+          verbose: 2
+          save: true
+
+      - name: Set up worktree
+        env:
+          FLAVOUR: ${{ matrix.flavour }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$FLAVOUR" = "plugins" ]; then
+            bun run setup -- --ci
+          else
+            bun run setup -- --ci --pluginless
+          fi
+
+      - name: Configure google-services.json
+        env:
+          FLAVOUR: ${{ matrix.flavour }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          worktree_dir="worktree-pluginless"
+          if [ "$FLAVOUR" = "plugins" ]; then
+            worktree_dir="worktree"
+          fi
+
+          commit=$(tr -d ' \r\n' < upstream-commit)
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid upstream-commit: $commit"
+            exit 1
+          fi
+
+          curl -fsSL "https://raw.githubusercontent.com/DrKLO/Telegram/$commit/TMessagesProj/google-services.json" -o "$RUNNER_TEMP/telegram-google-services.json"
+
+          python3 "$GITHUB_WORKSPACE/secure-builds/scripts/google_services.py" \
+            --input "$RUNNER_TEMP/telegram-google-services.json" \
+            --package ua.entaytion.entinygram \
+            --output "$worktree_dir/TMessagesProj/google-services.json" \
+            --output "$worktree_dir/TMessagesProj_App/google-services.json"
+
+      # Replaces upstream's `bun run tsx scripts/ci/version.ts`, which depends on repository
+      # variables (such as INU_DAY_STATE and LAST_RELEASE_SHA) and upstream-specific counter
+      # state not needed for autonomous, deterministic rebuilds.
+      # Upstream tags encode the release date and same-day counter (v13.1.1-202611020 =
+      # 2026-11-02, slot 0). Derive the versionCode the same way upstream's version.ts does
+      # (YYYYMMDD * 100 + counter * 10) so our builds always upgrade cleanly, in order.
+      - name: Compute version code
+        id: info
+        env:
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$NEW_REF" =~ ^v[0-9.]+-([0-9]{8})([0-9])$ ]]; then
+            echo "::error::Cannot derive a versionCode from tag '$NEW_REF' (expected v<name>-YYYYMMDDN)"
+            exit 1
+          fi
+          ver_code=$(( 10#${BASH_REMATCH[1]} * 100 + ${BASH_REMATCH[2]} * 10 ))
+          echo "ver-code=$ver_code" >> "$GITHUB_OUTPUT"
+          echo "versionCode: $ver_code"
+
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        with:
+          cache-cleanup: always
+
+      - name: Cache Android NDK & CMake
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+            ${{ env.ANDROID_HOME }}/cmake/3.31.6
+          key: android-ndk-cmake-27.2.12479018-3.31.6
+
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: >-
+            platforms;android-35
+            build-tools;35.0.0
+            cmake;3.31.6
+            ndk;27.2.12479018
+
+      - name: Tune Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.gradle
+          echo 'org.gradle.caching=true'                                              >> ~/.gradle/gradle.properties
+          echo 'org.gradle.parallel=true'                                             >> ~/.gradle/gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx8192m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
+          echo 'android.native.buildOutput=verbose'                                   >> ~/.gradle/gradle.properties
+
+      - name: Install libclang
+        if: ${{ matrix.flavour == 'plugins' }}
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sed -i -E 's|^URIs: mirror\+file:/etc/apt/apt-mirrors.txt|URIs: http://archive.ubuntu.com/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|' /etc/apt/sources.list 2>/dev/null || true
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=20"
+          ok=0
+          for i in 1 2 3; do
+            if sudo -E timeout 120 apt-get $APT_OPTS update -qq && sudo -E timeout 180 apt-get $APT_OPTS install -y --no-install-recommends libclang-dev; then
+              ok=1
+              break
+            fi
+            echo "apt attempt $i failed"
+            sleep 5
+          done
+          if [ "$ok" != 1 ]; then
+            echo "apt failed, falling back to the pip libclang wheel"
+            python3 -m pip install --user --break-system-packages libclang
+            echo "LIBCLANG_PATH=$(python3 -c 'import clang, os; print(os.path.join(os.path.dirname(clang.__file__), "native"))')" >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache cargo
+        if: ${{ matrix.flavour == 'plugins' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            src/native/target
+          key: ${{ runner.os }}-cargo-${{ matrix.flavour }}-${{ hashFiles('src/native/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.flavour }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Install Android Rust toolchain
+        if: ${{ matrix.flavour == 'plugins' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install cargo-ndk --version 4.1.2 --locked --force
+
+      - name: Reset ccache stats
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache -z
+
+      - name: Build ${{ matrix.flavour }} (arm64)
+        env:
+          COMMIT_ID: ${{ needs.check.outputs.new_ref }}
+          INU_BUILD: ${{ steps.info.outputs.ver-code }}
+          INU_BUILD_TYPE: release
+          ABI_FILTERS: arm64-v8a
+          CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: time_macros,file_macro,include_file_mtime,include_file_ctime,locale,system_headers
+          FLAVOUR: ${{ matrix.flavour }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          worktree_dir="worktree-pluginless"
+          if [ "$FLAVOUR" = "plugins" ]; then
+            worktree_dir="worktree"
+          fi
+          export CCACHE_BASEDIR="$GITHUB_WORKSPACE/$worktree_dir"
+
+          cd "$worktree_dir"
+          ./gradlew --no-daemon :TMessagesProj_App:assembleRelease
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          apk_path=$(find TMessagesProj_App/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$apk_path" ]; then
+            echo "::error::No release APK found in TMessagesProj_App/build/outputs/apk/release"
+            exit 1
+          fi
+          cp "$apk_path" "$GITHUB_WORKSPACE/out/unsigned-${FLAVOUR}.apk"
+
+      - name: Show ccache stats
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache -s -v
+
+      - name: Upload unsigned APK
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unsigned-${{ matrix.flavour }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-release:
+    name: Sign and publish release
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download unsigned pluginless APK
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned-pluginless
+          path: unsigned-pluginless
+
+      - name: Download unsigned plugins APK
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned-plugins
+          path: unsigned-plugins
+
+      - name: Download scan report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: scan-report
+          path: scan-report
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: build-tools;35.0.0
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 secret missing"
+            exit 1
+          fi
+          umask 077
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+
+      - name: Sign APKs and verify certificates
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          zipalign="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          expected_digest="4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6fdf605bd74c7c6b3547ec3"
+
+          mkdir -p release_apks
+
+          # 1. Sign pluginless APK
+          raw_pluginless=$(find unsigned-pluginless -name "*.apk" | head -n 1)
+          "$zipalign" -p -f 4 "$raw_pluginless" "$RUNNER_TEMP/aligned-pluginless.apk"
+          signed_pluginless="release_apks/entinygram-${NEW_REF}-arm64.apk"
+          "$apksigner" sign \
+            --ks "$RUNNER_TEMP/release.p12" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KS_PASS \
+            --out "$signed_pluginless" \
+            "$RUNNER_TEMP/aligned-pluginless.apk"
+
+          # Verify pluginless
+          certs_pluginless=$("$apksigner" verify --print-certs "$signed_pluginless")
+          echo "$certs_pluginless"
+          fp_pluginless=$(echo "$certs_pluginless" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ "$fp_pluginless" != "$expected_digest" ]; then
+            echo "::error::Pluginless Signer #1 SHA-256 digest mismatch! Expected $expected_digest, got $fp_pluginless"
+            exit 1
+          fi
+
+          # 2. Sign plugins APK
+          raw_plugins=$(find unsigned-plugins -name "*.apk" | head -n 1)
+          "$zipalign" -p -f 4 "$raw_plugins" "$RUNNER_TEMP/aligned-plugins.apk"
+          signed_plugins="release_apks/entinygram-${NEW_REF}-arm64-plugins.apk"
+          "$apksigner" sign \
+            --ks "$RUNNER_TEMP/release.p12" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KS_PASS \
+            --out "$signed_plugins" \
+            "$RUNNER_TEMP/aligned-plugins.apk"
+
+          # Verify plugins
+          certs_plugins=$("$apksigner" verify --print-certs "$signed_plugins")
+          echo "$certs_plugins"
+          fp_plugins=$(echo "$certs_plugins" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ "$fp_plugins" != "$expected_digest" ]; then
+            echo "::error::Plugins Signer #1 SHA-256 digest mismatch! Expected $expected_digest, got $fp_plugins"
+            exit 1
+          fi
+
+      - name: Wipe keystore
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/release.p12" "$RUNNER_TEMP"/aligned-*.apk
+
+      - name: Create release
+        env:
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release_apks
+          sha256sum *.apk > SHA256SUMS
+          cd ..
+
+          cp scan-report/report.md ./scan-report.md
+
+          {
+            echo "## EntinyGram ${NEW_REF}"
+            echo ""
+            echo "### Which APK to choose"
+            echo "- **\`entinygram-${NEW_REF}-arm64.apk\` (Recommended)**: Standard pluginless release for arm64 devices. Recommended for almost all users."
+            echo "- **\`entinygram-${NEW_REF}-arm64-plugins.apk\`**: Includes plugin engine support. Warning: When plugins are enabled, they run unsigned third-party plugin code with full access to messages and chat data. Plugins are disabled by default."
+            echo ""
+            echo "### Hardened defaults"
+            echo "This rebuild enforces hardened defaults:"
+            echo "- **Developer badges**: Disabled by default."
+            echo "- **In-app updater**: Disabled by default (updates handled via releases)."
+            echo ""
+            echo "### Signature verification"
+            echo "Verify the release using \`apksigner verify --print-certs <apk>\`:"
+            echo "- **Signer #1 certificate SHA-256 digest**: \`4E:96:02:8C:3C:E9:15:25:9B:2A:2F:4A:F4:BC:A7:F8:10:7D:C0:F9:D6:FD:F6:05:BD:74:C7:C6:B3:54:7E:C3\` (\`4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6fdf605bd74c7c6b3547ec3\`)"
+            echo ""
+            if [ -n "$APPROVE_REF" ]; then
+              echo "> [!NOTE]"
+              echo "> This release was manually approved by a human maintainer following review."
+              echo ""
+            fi
+            echo "### Security scan"
+            echo "See attached \`scan-report.md\` for the full deterministic scanner report."
+          } > release_notes.md
+
+          gh release create "entinygram-${NEW_REF}" \
+            --title "EntinyGram ${NEW_REF}" \
+            --notes-file release_notes.md \
+            release_apks/"entinygram-${NEW_REF}-arm64.apk" \
+            release_apks/"entinygram-${NEW_REF}-arm64-plugins.apk" \
+            release_apks/SHA256SUMS \
+            scan-report.md
+
+      - name: Update repository state
+        env:
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git checkout main
+          git pull --rebase origin main
+
+          tmp=$(mktemp)
+          jq --arg ref "$NEW_REF" '.built_ref = $ref | .audited_ref = $ref' state/entinygram.json > "$tmp"
+          mv "$tmp" state/entinygram.json
+
+          git add state/entinygram.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update EntinyGram state to ${NEW_REF} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Close review issue
+        env:
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_title="EntinyGram $NEW_REF needs review"
+          release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/entinygram-$NEW_REF"
+
+          issue_numbers=$(gh issue list --state open --search "$target_title" --json number,title | jq -r --arg target "$target_title" '.[] | select(.title == $target) | .number')
+
+          for num in $issue_numbers; do
+            gh issue comment "$num" --body "Released in [EntinyGram $NEW_REF]($release_url)."
+            gh issue close "$num"
+          done
