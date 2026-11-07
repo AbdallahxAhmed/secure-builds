@@ -25,4 +25,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+          # SC2129 (group >> redirects) is a style preference; everything else stays on.
+          docker run --rm -e SHELLCHECK_OPTS=--exclude=SC2129 -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color

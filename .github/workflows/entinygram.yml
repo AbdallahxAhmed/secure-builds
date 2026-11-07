@@ -295,7 +295,9 @@ jobs:
             echo "::error::Cannot derive a versionCode from tag '$NEW_REF' (expected v<name>-YYYYMMDDN)"
             exit 1
           fi
-          ver_code=$(( 10#${BASH_REMATCH[1]} * 100 + ${BASH_REMATCH[2]} * 10 ))
+          day=${BASH_REMATCH[1]}
+          slot=${BASH_REMATCH[2]}
+          ver_code=$(( 10#$day * 100 + slot * 10 ))
           echo "ver-code=$ver_code" >> "$GITHUB_OUTPUT"
           echo "versionCode: $ver_code"
 
@@ -339,10 +341,10 @@ jobs:
           set -euo pipefail
           sudo sed -i -E 's|^URIs: mirror\+file:/etc/apt/apt-mirrors.txt|URIs: http://archive.ubuntu.com/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
           sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|' /etc/apt/sources.list 2>/dev/null || true
-          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=20"
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20)
           ok=0
           for i in 1 2 3; do
-            if sudo -E timeout 120 apt-get $APT_OPTS update -qq && sudo -E timeout 180 apt-get $APT_OPTS install -y --no-install-recommends libclang-dev; then
+            if sudo -E timeout 120 apt-get "${APT_OPTS[@]}" update -qq && sudo -E timeout 180 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends libclang-dev; then
               ok=1
               break
             fi
@@ -554,7 +556,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release_apks
-          sha256sum *.apk > SHA256SUMS
+          sha256sum -- *.apk > SHA256SUMS
           cd ..
 
           cp scan-report/report.md ./scan-report.md

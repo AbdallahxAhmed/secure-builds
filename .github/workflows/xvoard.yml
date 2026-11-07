@@ -310,7 +310,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release_apk
-          sha256sum *.apk > SHA256SUMS
+          sha256sum -- *.apk > SHA256SUMS
           cd ..
 
           cp scan-report/report.md ./scan-report.md
