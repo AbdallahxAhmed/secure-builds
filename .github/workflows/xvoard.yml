@@ -1,0 +1,383 @@
+name: XVoard
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      approve_ref:
+        description: 'A commit SHA a human reviewed; skips the gate for exactly that ref'
+        required: false
+        type: string
+      force_build:
+        description: 'Force build even if ref already built'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: xvoard
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream updates
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      new_ref: ${{ steps.check_ref.outputs.new_ref }}
+      audited_ref: ${{ steps.check_ref.outputs.audited_ref }}
+      short_sha: ${{ steps.check_ref.outputs.short_sha }}
+      proceed: ${{ steps.check_ref.outputs.proceed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check upstream ref and state
+        id: check_ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          audited_ref=""
+          built_ref=""
+          if [ -f state/xvoard.json ]; then
+            audited_ref=$(jq -r '.audited_ref // ""' state/xvoard.json)
+            built_ref=$(jq -r '.built_ref // ""' state/xvoard.json)
+          fi
+
+          if [ -n "$APPROVE_REF" ]; then
+            new_ref="$APPROVE_REF"
+          else
+            new_ref=$(gh api repos/ANTI-XV/XVoard/commits/main --jq .sha)
+          fi
+
+          if [[ ! "$new_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid new_ref format: $new_ref"
+            exit 1
+          fi
+
+          short_sha="${new_ref:0:8}"
+
+          proceed="false"
+          if [ "$new_ref" != "$built_ref" ] || [ "$FORCE_BUILD" = "true" ] || [ -n "$APPROVE_REF" ]; then
+            proceed="true"
+          fi
+
+          echo "new_ref=$new_ref" >> "$GITHUB_OUTPUT"
+          echo "audited_ref=$audited_ref" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan upstream changes
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      gate: ${{ steps.eval_gate.outputs.gate }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Clone upstream and run scanner
+        id: run_scan
+        env:
+          AUDITED_REF: ${{ needs.check.outputs.audited_ref }}
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ANTI-XV/XVoard upstream
+          git -C upstream fetch origin "$AUDITED_REF"
+          git -C upstream fetch origin "$NEW_REF"
+
+          rc=0
+          python3 scripts/scan.py \
+            --repo upstream \
+            --old "$AUDITED_REF" \
+            --new "$NEW_REF" \
+            --profile apktool \
+            --trackers data/exodus-trackers.json \
+            --report report.md \
+            --json report.json || rc=$?
+
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Upload scan report artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: scan-report
+          path: |
+            report.md
+            report.json
+          if-no-files-found: ignore
+
+      - name: Evaluate scan results
+        id: eval_gate
+        env:
+          RC: ${{ steps.run_scan.outputs.rc }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$RC" -eq 2 ]; then
+            echo "::error::Scanner failed with usage or internal error (exit code 2)"
+            exit 2
+          fi
+
+          if [ "$RC" -ne 0 ] && [ "$RC" -ne 10 ]; then
+            echo "::error::Scanner failed with unexpected exit code $RC"
+            exit "$RC"
+          fi
+
+          if [ "$RC" -eq 10 ] && [ "$APPROVE_REF" != "$NEW_REF" ]; then
+            gh label create needs-review --description "Requires manual review" || true
+
+            target_title="XVoard $SHORT_SHA needs review"
+            issue_number=$(gh issue list --state open --search "$target_title" --json number,title | jq -r --arg target "$target_title" '.[] | select(.title == $target) | .number' | head -n 1)
+
+            head -c 60000 report.md > issue_body.md
+            printf "\n\n---\n[View full scan report artifact](%s/%s/actions/runs/%s)\n" \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> issue_body.md
+
+            if [ -n "$issue_number" ]; then
+              gh issue edit "$issue_number" --body-file issue_body.md
+            else
+              gh issue create --title "$target_title" --label "needs-review" --body-file issue_body.md
+            fi
+
+            echo "gate=blocked" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build XVoard APK
+    needs: [check, scan]
+    if: needs.scan.outputs.gate == 'pass'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout XVoard
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ANTI-XV/XVoard
+          ref: ${{ needs.check.outputs.new_ref }}
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Download and verify Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar" -o "$RUNNER_TEMP/apktool.jar"
+          echo "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423  $RUNNER_TEMP/apktool.jar" | sha256sum -c -
+
+      - name: Build APK with Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -jar "$RUNNER_TEMP/apktool.jar" b . -o unsigned.apk
+
+      - name: Upload unsigned APK
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unsigned
+          path: unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-release:
+    name: Sign and publish release
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download unsigned APK
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned
+          path: unsigned
+
+      - name: Download scan report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: scan-report
+          path: scan-report
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: build-tools;35.0.0
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 secret missing"
+            exit 1
+          fi
+          umask 077
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+
+      - name: Sign APK and verify certificate
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          zipalign="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          expected_digest="4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6fdf605bd74c7c6b3547ec3"
+
+          mkdir -p release_apk
+
+          raw_apk="unsigned/unsigned.apk"
+          if [ ! -f "$raw_apk" ]; then
+            raw_apk=$(find unsigned -name "*.apk" | head -n 1)
+          fi
+
+          "$zipalign" -p -f 4 "$raw_apk" "$RUNNER_TEMP/aligned.apk"
+          signed_apk="release_apk/xvoard-${SHORT_SHA}.apk"
+          "$apksigner" sign \
+            --ks "$RUNNER_TEMP/release.p12" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KS_PASS \
+            --out "$signed_apk" \
+            "$RUNNER_TEMP/aligned.apk"
+
+          certs_out=$("$apksigner" verify --print-certs "$signed_apk")
+          echo "$certs_out"
+          actual_digest=$(echo "$certs_out" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ "$actual_digest" != "$expected_digest" ]; then
+            echo "::error::Signer #1 SHA-256 digest mismatch! Expected $expected_digest, got $actual_digest"
+            exit 1
+          fi
+
+      - name: Wipe keystore
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/release.p12" "$RUNNER_TEMP"/aligned.apk
+
+      - name: Create release
+        env:
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+          APPROVE_REF: ${{ inputs.approve_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release_apk
+          sha256sum *.apk > SHA256SUMS
+          cd ..
+
+          cp scan-report/report.md ./scan-report.md
+
+          {
+            echo "## XVoard ${SHORT_SHA}"
+            echo ""
+            echo "### Privacy & Permissions"
+            echo "XVoard is an offline keyboard application. This build contains no internet access permissions (\`android.permission.INTERNET\` is absent), ensuring keystrokes and sensitive input data cannot leave your device."
+            echo ""
+            echo "### Signature verification"
+            echo "Verify the release using \`apksigner verify --print-certs <apk>\`:"
+            echo "- **Signer #1 certificate SHA-256 digest**: \`4E:96:02:8C:3C:E9:15:25:9B:2A:2F:4A:F4:BC:A7:F8:10:7D:C0:F9:D6:FD:F6:05:BD:74:C7:C6:B3:54:7E:C3\` (\`4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6fdf605bd74c7c6b3547ec3\`)"
+            echo ""
+            if [ -n "$APPROVE_REF" ]; then
+              echo "> [!NOTE]"
+              echo "> This release was manually approved by a human maintainer following review."
+              echo ""
+            fi
+            echo "### Security scan"
+            echo "See attached \`scan-report.md\` for the full deterministic scanner report."
+          } > release_notes.md
+
+          gh release create "xvoard-${SHORT_SHA}" \
+            --title "XVoard ${SHORT_SHA}" \
+            --notes-file release_notes.md \
+            release_apk/"xvoard-${SHORT_SHA}.apk" \
+            release_apk/SHA256SUMS \
+            scan-report.md
+
+      - name: Update repository state
+        env:
+          NEW_REF: ${{ needs.check.outputs.new_ref }}
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git checkout main
+          git pull --rebase origin main
+
+          tmp=$(mktemp)
+          jq --arg ref "$NEW_REF" '.built_ref = $ref | .audited_ref = $ref' state/xvoard.json > "$tmp"
+          mv "$tmp" state/xvoard.json
+
+          git add state/xvoard.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update XVoard state to ${SHORT_SHA} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Close review issue
+        env:
+          SHORT_SHA: ${{ needs.check.outputs.short_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_title="XVoard $SHORT_SHA needs review"
+          release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/xvoard-$SHORT_SHA"
+
+          issue_numbers=$(gh issue list --state open --search "$target_title" --json number,title | jq -r --arg target "$target_title" '.[] | select(.title == $target) | .number')
+
+          for num in $issue_numbers; do
+            gh issue comment "$num" --body "Released in [XVoard $SHORT_SHA]($release_url)."
+            gh issue close "$num"
+          done
