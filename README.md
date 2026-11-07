@@ -1,13 +1,14 @@
 # Secure Builds
 
-Automated, independent Android app rebuilds from source on GitHub Actions with deterministic security auditing.
+Automated, independent app rebuilds (Android APKs and Linux desktop binaries) from source on GitHub Actions with deterministic security auditing.
 
 ## What This Repo Builds and Why
 
-This repository tracks upstream releases and rebuilds APKs with reproducible toolchains and zero AI or human effort for routine updates:
+This repository tracks upstream releases and rebuilds binaries with reproducible toolchains and zero AI or human effort for routine updates:
 
 - **EntinyGram** (upstream: [`Entaytion/EntinyGram`](https://github.com/Entaytion/EntinyGram)): A privacy-focused Telegram Android client built as an StGit patchset on top of official Telegram source code.
 - **XVoard** (upstream: [`ANTI-XV/XVoard`](https://github.com/ANTI-XV/XVoard)): A privacy-centric offline Android keyboard project built with Apktool.
+- **64Gram** (upstream: [`TDesktop-x64/tdesktop`](https://github.com/TDesktop-x64/tdesktop)): An unofficial desktop Telegram client for Linux (x86_64) based on official Telegram Desktop, built with hardened privacy defaults and containerized CentOS build environments.
 
 Routine builds run without upstream secrets, telemetry tokens, or untrusted build infrastructure.
 
@@ -66,8 +67,13 @@ Builds in this repository enforce hardened configurations at compilation time:
   - **In-app updater disabled**: Background self-updater checks and APK downloads are disabled; updates are handled cleanly via GitHub releases.
 - **XVoard**:
   - **No Internet Access**: The application contains no `android.permission.INTERNET` permission, ensuring keystroke data cannot leave the device over the network.
+- **64Gram**:
+  - **Startup unsigned language pack fetch disabled**: In `Telegram/SourceFiles/storage/localstorage.cpp`, custom language pack fetching from `tdesktop-x64.github.io` is commented out (`CustomLangPack::fetchCustomLangPack`), stopping the client from downloading and applying unsigned UI string packs at launch.
+  - **Radio controller endpoint cleared**: In `Telegram/SourceFiles/core/enhanced_settings.cpp`, default `http://localhost:2468` URLs for `radio_controller` are cleared to empty string `""`, ensuring group-call join/leave hashes are never POSTed anywhere.
+  - **In-app updater disabled**: Automatic updates via `updates.64gr.am` are disabled (`-D DESKTOP_APP_DISABLE_AUTOUPDATE=ON`); updates are delivered cleanly via audited releases.
+  - **Crash reports disabled**: Crash reporting telemetry is turned off (`-D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON`).
 
-## Verifying APK Signatures
+## Verifying APK Signatures (EntinyGram & XVoard)
 
 All APKs published by this repository are aligned and signed with a dedicated release key. You can verify the integrity and origin of any downloaded APK using the official Android SDK tool `apksigner`:
 
@@ -84,6 +90,22 @@ Signer #1 certificate SHA-256 digest: 4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6
 Formatted with colons:
 `4E:96:02:8C:3C:E9:15:25:9B:2A:2F:4A:F4:BC:A7:F8:10:7D:C0:F9:D6:FD:F6:05:BD:74:C7:C6:B3:54:7E:C3`
 
-## Roadmap
+## Verifying 64Gram Linux Tarballs
 
-Support for reproducible, audited desktop builds of **64Gram** (desktop Telegram client) is coming next.
+Each 64Gram release publishes a portable tarball `64gram-<tag>-linux-x86_64.tar.gz`, `SHA256SUMS`, and a GitHub build provenance attestation.
+
+### 1. Check SHA-256 Checksum
+Verify the downloaded tarball against the provided `SHA256SUMS` file:
+```bash
+sha256sum -c SHA256SUMS
+```
+Or verify against the expected hash directly:
+```bash
+echo "<expected_hash>  64gram-<tag>-linux-x86_64.tar.gz" | sha256sum -c -
+```
+
+### 2. Verify GitHub Build Provenance Attestation
+Releases are signed using GitHub Actions build provenance attestations (`actions/attest-build-provenance`). You can verify that the binary was built in this repository's GitHub Actions pipeline from audited source code using the GitHub CLI:
+```bash
+gh attestation verify 64gram-<tag>-linux-x86_64.tar.gz --owner <owner>
+```

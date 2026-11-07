@@ -73,27 +73,43 @@ class ScanTest(unittest.TestCase):
             else:
                 target.write_text(content, encoding="utf-8")
         self._git("add", "-A")
-        self._git("commit", "-qm", message)
+        # several tdesktop fixtures commit identical trees on purpose
+        self._git("commit", "--allow-empty", "-qm", message)
         return self._git("rev-parse", "HEAD")
 
     # -- scan helpers ---------------------------------------------------------
 
     def run_scan(self, old: str, new: str, profile: str,
-                 trackers: dict | None = None):
+                 trackers: dict | None = None,
+                 base_old: str | None = None,
+                 base_new: str | None = None,
+                 subs_old: str | None = None,
+                 subs_new: str | None = None):
         trackers = trackers if trackers is not None else TRACKERS_FIXTURE
         with tempfile.TemporaryDirectory() as tmp:
             trackers_path = Path(tmp) / "trackers.json"
             trackers_path.write_text(json.dumps(trackers), encoding="utf-8")
             report = Path(tmp) / "report.md"
             as_json = Path(tmp) / "report.json"
+            cmd = [
+                sys.executable, str(SCAN),
+                "--repo", str(self.repo_path),
+                "--old", old, "--new", new,
+                "--profile", profile,
+                "--trackers", str(trackers_path),
+                "--report", str(report),
+                "--json", str(as_json),
+            ]
+            if base_old:
+                cmd.extend(["--base-old", base_old])
+            if base_new:
+                cmd.extend(["--base-new", base_new])
+            if subs_old:
+                cmd.extend(["--subs-old", subs_old])
+            if subs_new:
+                cmd.extend(["--subs-new", subs_new])
             proc = subprocess.run(
-                [sys.executable, str(SCAN),
-                 "--repo", str(self.repo_path),
-                 "--old", old, "--new", new,
-                 "--profile", profile,
-                 "--trackers", str(trackers_path),
-                 "--report", str(report),
-                 "--json", str(as_json)],
+                cmd,
                 capture_output=True, text=True, timeout=180)
             report_text = report.read_text(encoding="utf-8") \
                 if report.exists() else ""
@@ -400,6 +416,121 @@ class ScanTest(unittest.TestCase):
             [sys.executable, str(SCAN), "--nope"], capture_output=True,
             text=True)
         self.assertEqual(proc.returncode, 2)
+
+    # -- tdesktop-fork checks ---------------------------------------------------
+
+    def test_tdesktop_fork_introduced_host_flagged(self):
+        base_old = self.commit("base old", **{"Telegram/SourceFiles/main.cpp": "// v1\n"})
+        base_new = self.commit("base new", **{"Telegram/SourceFiles/main.cpp": "// v2\n"})
+        old = self.commit("fork old", **{"Telegram/SourceFiles/main.cpp": "// v1\n"})
+        new = self.commit("fork new", **{"Telegram/SourceFiles/main.cpp": '// v2\nval u = "https://fork.evil64.dev";\n'})
+        proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                        base_old=base_old, base_new=base_new)
+        self.assertEqual(proc.returncode, 10)
+        self.assertIn("1. NEW NETWORK HOSTS", report)
+        self.assertIn("fork.evil64.dev", report)
+
+    def test_tdesktop_upstream_introduced_host_info_only(self):
+        base_old = self.commit("base old", **{"Telegram/SourceFiles/main.cpp": "// v1\n"})
+        base_new = self.commit("base new", **{"Telegram/SourceFiles/main.cpp": '// v2\nval u = "https://official.telegram.org";\n'})
+        old = self.commit("fork old", **{"Telegram/SourceFiles/main.cpp": "// v1\n"})
+        new = self.commit("fork new", **{"Telegram/SourceFiles/main.cpp": '// v2\nval u = "https://official.telegram.org";\n'})
+        proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                        base_old=base_old, base_new=base_new)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("1. NEW NETWORK HOSTS", report)
+        self.assertIn("official.telegram.org", report)
+        self.assertIn("8. INFORMATIONAL", report)
+
+    def test_tdesktop_fork_delta_change_in_sensitive_path_flagged(self):
+        path = "Telegram/SourceFiles/config.h"
+        base_old = self.commit("base old", **{path: "#define VER 1\n"})
+        base_new = self.commit("base new", **{path: "#define VER 2\n"})
+        old = self.commit("fork old", **{path: "#define VER 1\n#define FORK_OPT 1\n"})
+        new = self.commit("fork new", **{path: "#define VER 2\n#define FORK_OPT 2\n"})
+        proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                        base_old=base_old, base_new=base_new)
+        self.assertEqual(proc.returncode, 10)
+        self.assertIn("6. SENSITIVE PATHS", report)
+        self.assertIn("Telegram/SourceFiles/config.h", report)
+
+    def test_tdesktop_unchanged_fork_delta_in_sensitive_path_not_flagged(self):
+        path = "Telegram/SourceFiles/config.h"
+        base_old = self.commit("base old", **{path: "int upstream_val = 1;\nint common = 100;\n"})
+        base_new = self.commit("base new", **{path: "int upstream_val = 2;\nint common = 100;\n"})
+        old = self.commit("fork old", **{path: "int upstream_val = 1;\nint common = 100;\nint fork_val = 42;\n"})
+        new = self.commit("fork new", **{path: "int upstream_val = 2;\nint common = 100;\nint fork_val = 42;\n"})
+        proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                        base_old=base_old, base_new=base_new)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("6. SENSITIVE PATHS", report)
+
+    def test_tdesktop_submodule_fork_delta_change_flagged(self):
+        base_old = self.commit("base old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        base_new = self.commit("base new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        old = self.commit("fork old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        new = self.commit("fork new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        with tempfile.TemporaryDirectory() as tmp_subs:
+            subs_old = Path(tmp_subs) / "subs_old"
+            subs_new = Path(tmp_subs) / "subs_new"
+            subs_old.mkdir()
+            subs_new.mkdir()
+            (subs_old / "lib_base.diff").write_text(
+                "--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n int a;\n+int b = 1;\n",
+                encoding="utf-8")
+            (subs_new / "lib_base.diff").write_text(
+                "--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n int a;\n+int b = 2;\n",
+                encoding="utf-8")
+            proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                            base_old=base_old, base_new=base_new,
+                                            subs_old=str(subs_old), subs_new=str(subs_new))
+            self.assertEqual(proc.returncode, 10)
+            self.assertIn("7. SUBMODULE FORK DELTAS", report)
+            self.assertIn("lib_base", report)
+
+    def test_tdesktop_identical_submodule_deltas_clean(self):
+        base_old = self.commit("base old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        base_new = self.commit("base new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        old = self.commit("fork old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        new = self.commit("fork new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        with tempfile.TemporaryDirectory() as tmp_subs:
+            subs_old = Path(tmp_subs) / "subs_old"
+            subs_new = Path(tmp_subs) / "subs_new"
+            subs_old.mkdir()
+            subs_new.mkdir()
+            (subs_old / "lib_base.diff").write_text(
+                "diff --git a/foo b/foo\nindex 1111111..2222222 100644\n--- a/foo\n+++ b/foo\n@@ -10,1 +10,2 @@\n int a;\n+int b = 1;\n",
+                encoding="utf-8")
+            (subs_new / "lib_base.diff").write_text(
+                "diff --git a/foo b/foo\nindex 3333333..4444444 100644\n--- a/foo\n+++ b/foo\n@@ -99,1 +99,2 @@\n int a;\n+int b = 1;\n",
+                encoding="utf-8")
+            proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                            base_old=base_old, base_new=base_new,
+                                            subs_old=str(subs_old), subs_new=str(subs_new))
+            self.assertEqual(proc.returncode, 0)
+            self.assertNotIn("7. SUBMODULE FORK DELTAS", report)
+
+    def test_tdesktop_submodule_new_host_flagged(self):
+        base_old = self.commit("base old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        base_new = self.commit("base new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        old = self.commit("fork old", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        new = self.commit("fork new", **{"Telegram/CMakeLists.txt": "# cmake\n"})
+        with tempfile.TemporaryDirectory() as tmp_subs:
+            subs_old = Path(tmp_subs) / "subs_old"
+            subs_new = Path(tmp_subs) / "subs_new"
+            subs_old.mkdir()
+            subs_new.mkdir()
+            (subs_old / "lib_base.diff").write_text(
+                "--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n int a;\n",
+                encoding="utf-8")
+            (subs_new / "lib_base.diff").write_text(
+                "--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n int a;\n+val s = \"https://submodule-telemetry.example-bad.com\";\n",
+                encoding="utf-8")
+            proc, report, _ = self.run_scan(old, new, "tdesktop-fork",
+                                            base_old=base_old, base_new=base_new,
+                                            subs_old=str(subs_old), subs_new=str(subs_new))
+            self.assertEqual(proc.returncode, 10)
+            self.assertIn("submodule-telemetry.example-bad.com", report)
 
 
 if __name__ == "__main__":
