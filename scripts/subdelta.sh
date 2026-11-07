@@ -121,8 +121,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     continue
   fi
 
-  git -C "$scratch" fetch --depth=1 -q "$upstream_url" "$upstream_pin"
-  git -C "$scratch" fetch --depth=1 -q "$fork_url" "$fork_pin"
+  git -C "$scratch" fetch --no-tags --depth=1 -q "$upstream_url" "$upstream_pin"
+  git -C "$scratch" fetch --no-tags --depth=1 -q "$fork_url" "$fork_pin"
 
   git -C "$scratch" diff "$upstream_pin" "$fork_pin" > "$out_diff"
 done <<< "$modules_txt"

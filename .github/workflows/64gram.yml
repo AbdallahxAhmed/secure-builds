@@ -123,8 +123,10 @@ jobs:
           fi
           new_base="v$new_ver"
 
-          git -C upstream fetch https://github.com/telegramdesktop/tdesktop "refs/tags/$old_base:refs/tags/upstream-$old_base"
-          git -C upstream fetch https://github.com/telegramdesktop/tdesktop "refs/tags/$new_base:refs/tags/upstream-$new_base"
+          # --no-tags: official tdesktop has its own v1.x tags from 2017-2018 with the
+          # same names as 64Gram releases; auto-followed tags must never shadow them.
+          git -C upstream fetch --no-tags https://github.com/telegramdesktop/tdesktop "refs/tags/$old_base:refs/tags/upstream-$old_base"
+          git -C upstream fetch --no-tags https://github.com/telegramdesktop/tdesktop "refs/tags/$new_base:refs/tags/upstream-$new_base"
 
           mkdir -p subs-old subs-new
           bash scripts/subdelta.sh upstream "$AUDITED_REF" subs-old "upstream-$old_base"
