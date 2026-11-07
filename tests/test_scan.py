@@ -335,7 +335,37 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 10)
         self.assertIn("src/fork/helpers/network/Client.kt", report)
 
-    def test_sensitive_upstream_commit_move(self):
+    def test_watched_config_change_is_info_only(self):
+        old, _ = self.baseline_commits()
+        new = self.commit(
+            "tweak defaults",
+            **{"src/fork/InuConfig.kt": "object InuConfig { val X = 1 }\n"})
+        proc, report, _ = self.run_scan(old, new, "android-patchset")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("[watched] `src/fork/InuConfig.kt`", report)
+
+    def test_single_label_host_placeholder_ignored(self):
+        old, _ = self.baseline_commits()
+        new = self.commit(
+            "test fixture",
+            **{"src/native/tests.rs": "let u = \"https://x\";\n"})
+        proc, report, _ = self.run_scan(old, new, "android-patchset")
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("host `x`", report)
+
+    def test_smali_tracker_signature_detected(self):
+        # code signatures must match smali's Lcom/foo/ form, not Lcom.foo/
+        old, _ = self.baseline_commits()
+        new = self.commit(
+            "smali tracker",
+            **{"smali/a/B.smali":
+               "invoke-static {}, Lcom/example/malware/Sdk;->init()V\n"})
+        proc, report, _ = self.run_scan(old, new, "apktool")
+        self.assertEqual(proc.returncode, 10)
+        self.assertRegex(report, r"ExampleAds \(code\): \d+ -> \d+ match\(es\), in: .*`smali/a/B\.smali`")
+
+    def test_upstream_commit_move_is_info_only(self):
+        # official Telegram base bumps are reported but do not block
         old = self.commit(
             "old",
             **{
@@ -346,7 +376,7 @@ class ScanTest(unittest.TestCase):
             "bump base",
             **{"upstream-commit": "1" * 40 + "\n"})
         proc, report, _ = self.run_scan(old, new, "android-patchset")
-        self.assertEqual(proc.returncode, 10)
+        self.assertEqual(proc.returncode, 0)
         self.assertIn("upstream-commit: " + "0" * 40 + " -> " + "1" * 40,
                       report)
         self.assertIn("-> " + "1" * 40, report)

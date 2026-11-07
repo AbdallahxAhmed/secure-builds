@@ -60,20 +60,18 @@ MAX_LOG_LINES = 20         # subjects shown in the informational section
 PROFILES = ("android-patchset", "apktool")
 
 # glob list is checked with fullmatch (see glob_to_regex)
+# Changes under these globs block the build (needs review).
 PROFILE_GLOBS: dict[str, list[str]] = {
     "android-patchset": [
         "src/fork/helpers/update/**",
         "src/fork/helpers/network/**",
-        "src/fork/helpers/plugins/**",
         "src/fork/helpers/badges/**",
         "src/fork/helpers/push/**",
-        "src/fork/helpers/translate/**",
-        "src/fork/InuConfig.kt",
         "patches/**/*network*",
         "patches/**/*update*",
-        ".github/**",
-        "scripts/**",
-        "upstream-commit",
+        # our CI runs these upstream scripts while building
+        "scripts/setup.ts",
+        "scripts/config.ts",
     ],
     "apktool": [
         "AndroidManifest.xml",
@@ -82,6 +80,24 @@ PROFILE_GLOBS: dict[str, list[str]] = {
         "smali*/**/net/**",
         "smali*/**/http*/**",
     ],
+}
+
+# Changes under these globs are listed in the report but do not block.
+# EntinyGram touches its config, plugin and translation code in nearly
+# every release; blocking on them would flag every update and defeat the
+# point of an unattended gate. New hosts, permissions, trackers,
+# dependencies and binaries in these files are still caught by their own
+# checks. upstream-commit is official Telegram code (out of scope).
+PROFILE_INFO_GLOBS: dict[str, list[str]] = {
+    "android-patchset": [
+        "src/fork/InuConfig.kt",
+        "src/fork/helpers/plugins/**",
+        "src/fork/helpers/translate/**",
+        ".github/**",
+        "scripts/**",
+        "upstream-commit",
+    ],
+    "apktool": [],
 }
 
 GREP_TEXT_EXTS = {  # never treat such blobs as corpus text
@@ -332,15 +348,18 @@ class Tree:
             raise ScanError("git cat-file --batch failed: %s"
                             % proc.stderr.decode("utf-8", "replace")[:400])
         data = proc.stdout
+        pos = 0  # advance an offset; re-slicing the remainder each time is O(n^2)
         for _ in wanted:
-            line_end = data.find(b"\n", 0)
-            header = data[:line_end].decode("ascii", "replace").split()
-            data = data[line_end + 1:]
+            line_end = data.find(b"\n", pos)
+            if line_end == -1:
+                break
+            header = data[pos:line_end].decode("ascii", "replace").split()
+            pos = line_end + 1
             if len(header) < 3 or header[2] == "missing":
                 continue
             _hdr_oid, _otype, size = header[0], header[1], int(header[2])
-            self.raw[_hdr_oid] = data[:size]
-            data = data[size + 1:]
+            self.raw[_hdr_oid] = data[pos:pos + size]
+            pos += size + 1
         for path, oid in self.files.items():
             raw = self.raw.get(oid)
             if raw is None:
@@ -466,6 +485,8 @@ def normalize_host(authority: str) -> str:
 def host_ignored(host: str) -> bool:
     if host in IGNORED_HOSTS:
         return True
+    if "." not in host:  # single-label placeholders such as https://x in tests
+        return True
     return any(host.endswith(suffix) for suffix in IGNORED_HOST_SUFFIXES)
 
 
@@ -504,62 +525,72 @@ def manifest_permissions(text: str) -> set[str]:
     return out
 
 
-def build_tracker_matcher(trackers: dict) -> tuple[re.Pattern | None,
-                                                   dict[str, tuple[str, str]],
-                                                   list[str]]:
-    """One combined alternation regex across all tracker signatures.
+TrackerMatcher = tuple[str, str, tuple[str, ...], "re.Pattern | None"]
 
-    groups map: group-name -> (tracker name, 'code'|'network')
-    Warns for unusable network_signature regexes.
+
+def build_tracker_matcher(trackers: dict) -> tuple[list[TrackerMatcher] | None,
+                                                   dict,
+                                                   list[str]]:
+    """Per-tracker matchers: (tracker name, 'code'|'network', literal
+    package prefixes in dotted and smali-slash form, network regex).
+
+    Warns for unusable network_signature regexes. The middle value is an
+    unused placeholder kept for call-site compatibility.
     """
-    groups: dict[str, tuple[str, str]] = {}
-    alternates: list[str] = []
+    # One matcher per (tracker, kind) rather than one combined alternation:
+    # a ~900-way alternation defeats the regex engine's literal-prefix
+    # search and took tens of minutes on real release diffs. Code
+    # signatures are plain package prefixes, so they are counted with
+    # str.count; network signatures stay regexes, compiled one by one.
+    matchers: list[tuple[str, str, tuple[str, ...], re.Pattern | None]] = []
     warns: list[str] = []
     for tid, entry in trackers.items():
         name = str(entry.get("name") or tid)
         code_sig = (entry.get("code_signature") or "").strip()
         parts = [p.strip() for p in code_sig.split("|") if p.strip()]
         if parts:
-            dotted = "|".join(re.escape(p) for p in parts)
-            slash = "|".join(re.escape(
-                "L" + p.rstrip(".") + "/") for p in parts)
-            gname = "c" + re.sub(r"[^0-9A-Za-z_]", "_", tid)
-            alternates.append(f"(?P<{gname}>{dotted}|{slash})")
-            groups[gname] = (name, "code")
+            literals = tuple(parts) + tuple(
+                "L" + p.rstrip(".").replace(".", "/") + "/" for p in parts)
+            matchers.append((name, "code", literals, None))
         net_sig = (entry.get("network_signature") or "").strip()
         if net_sig:
             try:
-                re.compile(net_sig)
+                compiled = re.compile(net_sig)
             except re.error:
                 warns.append("tracker %r network_signature %-40.40r "
                              "does not compile" % (name, net_sig))
                 continue
-            gname = "n" + re.sub(r"[^0-9A-Za-z_]", "_", tid)
-            alternates.append(f"(?P<{gname}>{net_sig})")
-            groups[gname] = (name, "network")
-    if not alternates:
-        return None, groups, warns
-    return re.compile("|".join(alternates)), groups, warns
+            matchers.append((name, "network", (), compiled))
+    if not matchers:
+        return None, {}, warns
+    return matchers, {}, warns
 
 
-def count_tracker_hits(pattern: re.Pattern, groups: dict[str, tuple[str, str]],
-                       tree: Tree) -> tuple[dict[tuple[str, str], int],
-                                            dict[tuple[str, str], set[str]]]:
-    """occurrence counts + matched-file examples per (tracker, kind)."""
+def count_tracker_hits(matchers: list[TrackerMatcher], _unused: dict,
+                       tree: Tree, paths: set[str]
+                       ) -> tuple[dict[tuple[str, str], int],
+                                  dict[tuple[str, str], set[str]]]:
+    """occurrence counts + matched-file examples per (tracker, kind),
+    restricted to `paths`.
+
+    Callers pass only the files that differ between OLD and NEW: an
+    unchanged file contributes the same count to both sides, so the
+    old-vs-new delta is identical while unchanged files are skipped."""
     counts: dict[tuple[str, str], int] = {}
     files_seen: dict[tuple[str, str], set[str]] = {}
-    for path in sorted(tree.text):
-        content = tree.text[path]
+    for path in sorted(paths):
+        content = tree.text.get(path)
         if not content:
             continue
-        for m in pattern.finditer(content):
-            gname = m.lastgroup
-            if not gname or gname not in groups:
-                continue
-            tracker_name, kind = groups[gname]
-            key = (tracker_name, kind)
-            counts[key] = counts.get(key, 0) + 1
-            files_seen.setdefault(key, set()).add(path)
+        for name, kind, literals, regex in matchers:
+            if regex is not None:
+                hits = sum(1 for _ in regex.finditer(content))
+            else:
+                hits = sum(content.count(lit) for lit in literals)
+            if hits:
+                key = (name, kind)
+                counts[key] = counts.get(key, 0) + hits
+                files_seen.setdefault(key, set()).add(path)
     return counts, files_seen
 
 
@@ -672,18 +703,34 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
         old_perms |= manifest_permissions(old_tree.text_of(path))
     added_perms = sorted(new_perms - old_perms)
     if profile == "apktool":
-        hits = sum(new_tree.text_of(p).count("android.permission.INTERNET")
-                   for p in new_tree.text)
-        if hits:
+        internet = "android.permission.INTERNET"
+        # Requested in a manifest: always critical, whatever OLD had.
+        requested = sorted(
+            p for p in new_tree.text
+            if file_basename(p) == "AndroidManifest.xml"
+            and internet in manifest_permissions(new_tree.text[p]))
+        # Mentioned as text elsewhere: Google's own smali already names the
+        # permission as a string constant, so only an increase is suspicious.
+        def mentions(tree: Tree) -> int:
+            return sum(tree.text_of(p).count(internet) for p in tree.text
+                       if file_basename(p) != "AndroidManifest.xml")
+        old_mentions, new_mentions = mentions(old_tree), mentions(new_tree)
+        if requested:
             sec_perms.is_critical = True
             sec_perms.add(
-                "`android.permission.INTERNET` occurs %d time(s) in the NEW "
-                "tree. A decompiled keyboard gaining network access must "
-                "always be reviewed by a human." % hits)
-            files_with_internet = [
-                p for p in sorted(new_tree.text)
-                if "android.permission.INTERNET" in new_tree.text[p]][:5]
-            for p in files_with_internet:
+                "`%s` is REQUESTED in the NEW manifest. A decompiled keyboard "
+                "gaining network access must always be reviewed by a human."
+                % internet)
+            for p in requested:
+                sec_perms.add("  - `%s`" % p)
+        elif new_mentions > old_mentions:
+            sec_perms.is_critical = True
+            sec_perms.add(
+                "`%s` mentioned %d -> %d time(s) outside the manifest; new "
+                "code references the network permission." %
+                (internet, old_mentions, new_mentions))
+            for p in sorted(p for p in new_tree.text
+                            if internet in new_tree.text[p])[:5]:
                 sec_perms.add("  - `%s`" % p)
     if added_perms:
         if not sec_perms.is_critical:
@@ -705,8 +752,11 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
     sec_track = Section("3. TRACKERS")
     pattern, groups, warns = build_tracker_matcher(tracker_data["trackers"])
     if pattern is not None:
-        old_counts, _ = count_tracker_hits(pattern, groups, old_tree)
-        new_counts, file_hits = count_tracker_hits(pattern, groups, new_tree)
+        changed_paths = set(changes)
+        old_counts, _ = count_tracker_hits(pattern, groups, old_tree,
+                                           changed_paths)
+        new_counts, file_hits = count_tracker_hits(pattern, groups, new_tree,
+                                                   changed_paths)
         for key in sorted(new_counts):
             hits_old = old_counts.get(key, 0)
             hits_new = new_counts[key]
@@ -780,9 +830,13 @@ def run_scan(repo: str, old_ref: str, new_ref: str, profile: str,
     # ---- 6. sensitive paths ------------------------------------------------------
     sec_sensitive = Section("6. SENSITIVE PATHS")
     sensitive = [glob_to_regex(g) for g in PROFILE_GLOBS[profile]]
+    watched = [glob_to_regex(g) for g in PROFILE_INFO_GLOBS.get(profile, [])]
     for path, st in sorted(changes.items()):
         if is_sensitive_path(path, sensitive):
             sec_sensitive.add("`%s` changed (%s)" % (path, STATUS_NAME.get(st, st)))
+        elif is_sensitive_path(path, watched):
+            sec_info.add("[watched] `%s` changed (%s)"
+                         % (path, STATUS_NAME.get(st, st)))
     if not sec_sensitive.empty():
         sections.append(sec_sensitive)
 
