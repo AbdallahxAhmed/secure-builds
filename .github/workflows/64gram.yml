@@ -262,7 +262,7 @@ jobs:
           sudo apt update
           sudo apt install -y python3-jinja2
           cd Telegram/build/docker/centos_env
-          DOCKERFILE=$(DEBUG= python3 gen_dockerfile.py)
+          DOCKERFILE=$(DEBUG="" python3 gen_dockerfile.py)
           echo "$DOCKERFILE" > Dockerfile
           rm -rf __pycache__
 
@@ -338,7 +338,7 @@ jobs:
           set -euo pipefail
           # DESKTOP_APP_ENABLE_LTO=OFF: LTO doubles build time on a 4-core runner
           docker run --rm \
-            -u $(id -u) \
+            -u "$(id -u)" \
             -v "$PWD":/usr/src/tdesktop \
             -v "$PWD/../DesktopPrivate":/usr/src/DesktopPrivate \
             -e CONFIG=Release \
