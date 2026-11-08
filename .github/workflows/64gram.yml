@@ -339,11 +339,14 @@ jobs:
         run: |
           set -euo pipefail
           # DESKTOP_APP_ENABLE_LTO=OFF: LTO doubles build time on a 4-core runner.
-          # Without LTO, GCC 15 inlines official Telegram code differently and
-          # -Werror (set by DESKTOP_APP_SPECIAL_TARGET) turns one
-          # aggressive-loop-optimizations warning in statistics_data_deserialize.cpp
-          # into a hard error. Downgrade only that warning, and APPEND to the
-          # image's CXXFLAGS so its hardening flags (-fhardened, -O3, ...) stay.
+          # Without LTO, GCC 15 inlines official Telegram code differently, and
+          # -Werror (set by DESKTOP_APP_SPECIAL_TARGET, which we keep because it
+          # also selects the official linking/packaging mode) turns GCC's
+          # inlining-dependent flow warnings into hard errors. Seen so far:
+          # aggressive-loop-optimizations (statistics_data_deserialize.cpp) and
+          # dangling-pointer (history_view_voice_record_bar.cpp). Downgrade only
+          # that family to warnings, and APPEND to the image's CXXFLAGS so its
+          # hardening flags (-fhardened, -O3, ...) stay.
           # shellcheck disable=SC2016  # $CXXFLAGS must expand inside the container
           docker run --rm \
             -u "$(id -u)" \
@@ -352,7 +355,7 @@ jobs:
             -e CONFIG=Release \
             -e KEEP_GOING=1 \
             "$IMAGE_TAG" \
-            bash -c 'export CXXFLAGS="$CXXFLAGS -Wno-error=aggressive-loop-optimizations"; exec /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh "$@"' build.sh \
+            bash -c 'export CXXFLAGS="$CXXFLAGS -Wno-error=aggressive-loop-optimizations -Wno-error=dangling-pointer -Wno-error=maybe-uninitialized -Wno-error=array-bounds -Wno-error=use-after-free -Wno-error=restrict"; exec /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh "$@"' build.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
             -D DESKTOP_APP_ENABLE_LTO=OFF \
             -D TDESKTOP_API_ID="$API_ID" \
