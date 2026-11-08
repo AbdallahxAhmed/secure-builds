@@ -149,8 +149,12 @@ install_user() {
   for s in "${ICON_SIZES[@]}"; do
     install -Dm644 "$tmp/icon$s.png" "${DATA}/icons/hicolor/${s}x${s}/apps/${APP_ID}.png"
   done
-  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "${DATA}/applications" || true
-  command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t "${DATA}/icons/hicolor" 2>/dev/null || true
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q "${DATA}/applications" || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t "${DATA}/icons/hicolor" 2>/dev/null || true
+  fi
 
   say "Installed 64Gram $ref to $OPT_DIR"
   say "Start it from your app menu or run: $BIN_LINK"
