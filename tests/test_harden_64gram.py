@@ -35,6 +35,46 @@ void EnhancedSettings::load() {
 }
 """
 
+FIXTURE_OPTIONS_WIN_CMAKE = """\
+# This file is part of Desktop App Toolkit.
+
+target_compile_definitions(common_options
+INTERFACE
+    UNICODE
+)
+
+target_link_options(common_options
+INTERFACE
+        $<$<NOT:$<CONFIG:Debug>>:/OPT:REF>
+        /INCREMENTAL:NO
+)
+"""
+
+FIXTURE_OPTIONS_WIN_CMAKE_NO_ANCHOR = """\
+target_link_options(common_options
+INTERFACE
+    $<$<NOT:$<CONFIG:Debug>>:/OPT:REF>
+)
+"""
+
+FIXTURE_OPTIONS_WIN_CMAKE_TWO_ANCHORS = """\
+target_link_options(common_options
+INTERFACE
+        /INCREMENTAL:NO
+        /INCREMENTAL:NO
+)
+"""
+
+FIXTURE_OPTIONS_WIN_CMAKE_ALREADY_PATCHED = """\
+target_link_options(common_options
+INTERFACE
+        /INCREMENTAL:NO
+        /DEPENDENTLOADFLAG:0x800
+)
+"""
+
+FLAG_LINE = "        /DEPENDENTLOADFLAG:0x800"
+
 
 class Harden64gramTest(unittest.TestCase):
     def run_harden(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -152,6 +192,112 @@ class Harden64gramTest(unittest.TestCase):
             fake_dir = Path(tmp) / "does_not_exist"
             proc = self.run_harden(str(fake_dir))
             self.assertEqual(proc.returncode, 2)
+
+    def _setup_options_win_cmake(self, root: Path, content: str) -> Path:
+        f3 = root / "cmake" / "options_win.cmake"
+        f3.parent.mkdir(parents=True, exist_ok=True)
+        f3.write_text(content, encoding="utf-8")
+        return f3
+
+    def test_windows_inserts_flag_after_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            f1, f2 = self._setup_worktree(worktree)
+            f3 = self._setup_options_win_cmake(worktree, FIXTURE_OPTIONS_WIN_CMAKE)
+
+            proc = self.run_harden(str(worktree), "--windows")
+            self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
+
+            # Verify stdout mentions the inserted linker flag
+            self.assertIn("Inserted linker flag in options_win.cmake:", proc.stdout)
+            self.assertIn("/DEPENDENTLOADFLAG:0x800", proc.stdout)
+
+            # Verify f3: flag on its own line right after the anchor, exactly once
+            c3 = f3.read_text(encoding="utf-8")
+            self.assertIn(
+                "\n        /INCREMENTAL:NO\n        /DEPENDENTLOADFLAG:0x800\n",
+                c3,
+            )
+            self.assertEqual(c3.count("/DEPENDENTLOADFLAG:0x800"), 1)
+
+            # Verify the regular replacements were applied too
+            self.assertIn(
+                "// CustomLangPack::currentInstance()->fetchCustomLangPack(langPackId, langPackBaseId);",
+                f1.read_text(encoding="utf-8"),
+            )
+            self.assertIn('radio_controller_url = "";', f2.read_text(encoding="utf-8"))
+
+    def test_windows_flag_already_present_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            f1, f2 = self._setup_worktree(worktree)
+            f3 = self._setup_options_win_cmake(worktree, FIXTURE_OPTIONS_WIN_CMAKE_ALREADY_PATCHED)
+
+            proc = self.run_harden(str(worktree), "--windows")
+            self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
+
+            # Verify stdout reports the flag is already present
+            self.assertIn("Already present in options_win.cmake:", proc.stdout)
+            self.assertNotIn("Inserted linker flag", proc.stdout)
+
+            # Verify f3 is byte-for-byte unchanged
+            self.assertEqual(f3.read_text(encoding="utf-8"), FIXTURE_OPTIONS_WIN_CMAKE_ALREADY_PATCHED)
+
+            # Verify the regular replacements were applied
+            self.assertIn('radio_controller_url = "";', f2.read_text(encoding="utf-8"))
+
+    def test_windows_missing_anchor_fails_and_leaves_files_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            f1, f2 = self._setup_worktree(worktree)
+            f3 = self._setup_options_win_cmake(worktree, FIXTURE_OPTIONS_WIN_CMAKE_NO_ANCHOR)
+
+            proc = self.run_harden(str(worktree), "--windows")
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("options_win.cmake", proc.stderr)
+            self.assertIn("0 time(s)", proc.stderr)
+
+            # Verify all files are untouched (all-or-nothing)
+            self.assertEqual(f1.read_text(encoding="utf-8"), FIXTURE_LOCALSTORAGE)
+            self.assertEqual(f2.read_text(encoding="utf-8"), FIXTURE_ENHANCED_SETTINGS)
+            self.assertEqual(f3.read_text(encoding="utf-8"), FIXTURE_OPTIONS_WIN_CMAKE_NO_ANCHOR)
+
+    def test_windows_duplicate_anchor_fails_and_leaves_files_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            f1, f2 = self._setup_worktree(worktree)
+            f3 = self._setup_options_win_cmake(worktree, FIXTURE_OPTIONS_WIN_CMAKE_TWO_ANCHORS)
+
+            proc = self.run_harden(str(worktree), "--windows")
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("options_win.cmake", proc.stderr)
+            self.assertIn("2 time(s)", proc.stderr)
+            self.assertIn("expected exactly 1", proc.stderr)
+
+            # Verify all files are untouched (all-or-nothing)
+            self.assertEqual(f1.read_text(encoding="utf-8"), FIXTURE_LOCALSTORAGE)
+            self.assertEqual(f2.read_text(encoding="utf-8"), FIXTURE_ENHANCED_SETTINGS)
+            self.assertEqual(f3.read_text(encoding="utf-8"), FIXTURE_OPTIONS_WIN_CMAKE_TWO_ANCHORS)
+
+    def test_without_windows_cmake_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            f1, f2 = self._setup_worktree(worktree)
+            # Even a file that would need patching (no anchor, no flag) must
+            # stay untouched when --windows is not given
+            f3 = self._setup_options_win_cmake(worktree, FIXTURE_OPTIONS_WIN_CMAKE_NO_ANCHOR)
+
+            proc = self.run_harden(str(worktree))
+            self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
+            self.assertNotIn("options_win.cmake", proc.stdout)
+
+            # Verify f3 untouched, regular replacements applied
+            self.assertEqual(f3.read_text(encoding="utf-8"), FIXTURE_OPTIONS_WIN_CMAKE_NO_ANCHOR)
+            self.assertIn(
+                "// CustomLangPack::currentInstance()->fetchCustomLangPack(langPackId, langPackBaseId);",
+                f1.read_text(encoding="utf-8"),
+            )
+            self.assertIn('radio_controller_url = "";', f2.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
