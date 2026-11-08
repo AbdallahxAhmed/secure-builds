@@ -338,7 +338,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # DESKTOP_APP_ENABLE_LTO=OFF: LTO doubles build time on a 4-core runner.
+          # No LTO, as in official tdesktop CI (which generates its image with
+          # LTO=). Our image keeps LTO on so the cached libraries stay valid, and
+          # it injects -flto=auto -ffat-lto-objects through CFLAGS/CXXFLAGS:
+          # DESKTOP_APP_ENABLE_LTO=OFF alone does not stop that, and the final
+          # whole-program LTO link got the compiler OOM-killed on the 16 GB
+          # runner. So strip those flags from the app build and link with
+          # -fno-lto; the image's static libraries are fat objects, so their
+          # regular machine code links fine without LTO.
           # Without LTO, GCC 15 inlines official Telegram code differently, and
           # -Werror (set by DESKTOP_APP_SPECIAL_TARGET, which we keep because it
           # also selects the official linking/packaging mode) turns GCC's
@@ -355,7 +362,7 @@ jobs:
             -e CONFIG=Release \
             -e KEEP_GOING=1 \
             "$IMAGE_TAG" \
-            bash -c 'export CXXFLAGS="$CXXFLAGS -Wno-error=aggressive-loop-optimizations -Wno-error=dangling-pointer -Wno-error=maybe-uninitialized -Wno-error=array-bounds -Wno-error=use-after-free -Wno-error=restrict"; exec /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh "$@"' build.sh \
+            bash -c 'nolto() { local f=${1//-flto=auto/}; printf "%s" "${f//-ffat-lto-objects/}"; }; export CFLAGS="$(nolto "$CFLAGS")" CXXFLAGS="$(nolto "$CXXFLAGS") -Wno-error=aggressive-loop-optimizations -Wno-error=dangling-pointer -Wno-error=maybe-uninitialized -Wno-error=array-bounds -Wno-error=use-after-free -Wno-error=restrict" LDFLAGS="$LDFLAGS -fno-lto"; case "$CFLAGS $CXXFLAGS" in *-flto*) echo "LTO flags still present" >&2; exit 1;; esac; exec /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh "$@"' build.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
             -D DESKTOP_APP_ENABLE_LTO=OFF \
             -D TDESKTOP_API_ID="$API_ID" \
