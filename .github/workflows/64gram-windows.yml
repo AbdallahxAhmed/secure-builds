@@ -106,15 +106,98 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Prepare directories
-        shell: cmd
+      # Disk space gate: the Qt 6.11.2 static build (Debug + RelWithDebInfo,
+      # with PDBs and precompiled headers) once filled the disk after 80
+      # minutes and died with C1085 "not enough space on the disk", so delete
+      # preinstalled image bloat this build never uses first. Only C: paths
+      # are touched, each only if it exists, and removal failures are logged
+      # as warnings and never fail the job.
+      - name: Free runner disk space
+        shell: pwsh
         run: |
-          mkdir %userprofile%\TBuild\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
-          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
-          echo REPO_NAME=tdesktop>>%GITHUB_ENV%
-          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
-          echo RELEASEPATH=%GITHUB_WORKSPACE%\TBuild\tdesktop\out\Release>>%GITHUB_ENV%
+          function Show-FreeSpace {
+            Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+              '{0}: {1:N1} GB free' -f $_.Name, ($_.Free / 1GB)
+            }
+          }
+          Write-Host 'Free space before cleanup:'
+          Show-FreeSpace
+          # Deliberately kept: Python, Strawberry Perl, Git, CMake, LLVM,
+          # Visual Studio, Windows Kits, dotnet, Inno Setup, msys64 and
+          # everything under C:\Users.
+          $targets = @(
+            'C:\Android'
+            'C:\ghcup'
+            'C:\cabal'
+            'C:\tools\kotlinc'
+            'C:\Program Files\R'
+            'C:\Program Files\MongoDB'
+            'C:\Program Files\MySQL'
+            'C:\SeleniumWebDrivers'
+            'C:\Program Files (x86)\sbt'
+            'C:\Program Files\Amazon'
+            'C:\ProgramData\chocolatey\lib\maven'
+            'C:\ProgramData\chocolatey\lib\pulumi'
+            'C:\hostedtoolcache\windows\go'
+            'C:\hostedtoolcache\windows\Ruby'
+            'C:\hostedtoolcache\windows\PyPy'
+            'C:\hostedtoolcache\windows\node'
+            'C:\hostedtoolcache\windows\CodeQL'
+            'C:\hostedtoolcache\windows\stack'
+          )
+          $targets += @(Get-ChildItem 'C:\hostedtoolcache\windows' -Filter 'Java_*' -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+          # rmdir /s /q is far faster than Remove-Item on these big trees.
+          foreach ($t in $targets) {
+            if (-not (Test-Path -LiteralPath $t)) { continue }
+            try {
+              cmd /c rmdir /s /q "$t" 2>&1 | Out-Null
+            } catch {
+              Write-Host ('rmdir on {0} failed, continuing: {1}' -f $t, $_)
+            }
+            if (Test-Path -LiteralPath $t) {
+              Write-Host ('::warning::could not fully remove {0}' -f $t)
+            }
+          }
+          Write-Host 'Free space after cleanup:'
+          Show-FreeSpace
+          # A failed rmdir leaves a nonzero $LASTEXITCODE, which the pwsh
+          # wrapper would turn into a job failure; cleanup is best effort.
+          exit 0
+
+      # TBuild lives outside the workspace, symlinked in, as in official CI;
+      # put the real directory on whichever of C: and D: has more free space
+      # right now (the PDB-heavy Qt build once filled C:, C1085).
+      - name: Prepare directories
+        shell: pwsh
+        run: |
+          $cFree = (Get-PSDrive -Name C).Free
+          Write-Host ('Free space on C: {0:N1} GB' -f ($cFree / 1GB))
+          $realRoot = Join-Path $env:USERPROFILE 'TBuild'
+          $drive = 'C'
+          $d = Get-PSDrive -Name D -ErrorAction SilentlyContinue
+          if ($d) {
+            Write-Host ('Free space on D: {0:N1} GB' -f ($d.Free / 1GB))
+            if ($d.Free -gt $cFree) {
+              $realRoot = 'D:\TBuild'
+              $drive = 'D'
+            }
+          } else {
+            Write-Host 'D: does not exist; using C:'
+          }
+          Write-Host ('TBuild on drive {0}: real directory {1}' -f $drive, $realRoot)
+          New-Item -ItemType Directory -Path $realRoot -Force -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $realRoot 'Libraries') -Force -ErrorAction Stop | Out-Null
+          $link = Join-Path $env:GITHUB_WORKSPACE 'TBuild'
+          try {
+            New-Item -ItemType SymbolicLink -Path $link -Target $realRoot -ErrorAction Stop | Out-Null
+          } catch {
+            throw ('Failed to create symlink {0} -> {1}: {2}' -f $link, $realRoot, $_)
+          }
+          # Same values as before, all through %GITHUB_WORKSPACE%\TBuild.
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value "TBUILD=$link"
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value 'REPO_NAME=tdesktop'
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value "LibrariesPath=$link\Libraries\win64"
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value "RELEASEPATH=$link\tdesktop\out\Release"
 
       - name: Checkout 64Gram
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -262,6 +345,21 @@ jobs:
           rem so the libraries need their Release variants too.
           %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
 
+      # Diagnostic: how full the disks are right after the library build,
+      # where the last run hit C1085 disk-full; must never fail.
+      - name: Disk space after libraries
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+              '{0}: {1:N1} GB free, {2:N1} GB used' -f $_.Name, ($_.Free / 1GB), ($_.Used / 1GB)
+            }
+          } catch {
+            Write-Host ('Disk space probe failed: {0}' -f $_)
+          }
+          exit 0
+
       # Same prune as official CI, but keep tdesktop_rust/out: its generated
       # wallet_engine.cpp is compiled by the app build (official CI's list
       # predates the Rust wallet engine and deletes it).
@@ -364,6 +462,21 @@ jobs:
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 
           cmake --build ..\out --config Release --target Telegram --parallel
+
+      # Diagnostic: how full the disks are right after the app build;
+      # must never fail.
+      - name: Disk space after app build
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+              '{0}: {1:N1} GB free, {2:N1} GB used' -f $_.Name, ($_.Free / 1GB), ($_.Used / 1GB)
+            }
+          } catch {
+            Write-Host ('Disk space probe failed: {0}' -f $_)
+          }
+          exit 0
 
       - name: Make sure d3dcompiler_47.dll is in ReleasePath
         if: steps.libraries.outcome == 'success'
