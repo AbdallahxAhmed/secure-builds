@@ -184,6 +184,24 @@ jobs:
           git config --global user.email "you@example.com"
           git config --global user.name "Sample"
 
+      # The runner image ships Visual Studio 2026; the MSVC 14.44 toolset that
+      # official CI pins is a side-by-side component there, installed without
+      # its ATL headers (atlbase.h), which breakpad's Release tools need.
+      - name: Add ATL for the MSVC 14.44 toolset
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host "Visual Studio: $vs"
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+            'modify','--installPath',"`"$vs`"", `
+            '--add','Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL', `
+            '--quiet','--norestart','--nocache'
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "vs_installer exit code $($p.ExitCode)" }
+          $atl = Get-ChildItem "$vs\VC\Tools\MSVC\14.44.*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue
+          if (-not $atl) { throw "atlbase.h still missing for MSVC 14.44" }
+          Write-Host "ATL headers: $($atl.FullName)"
+
       - name: Native Tools Command Prompt
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
