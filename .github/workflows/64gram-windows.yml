@@ -175,6 +175,9 @@ jobs:
 
           sha256sum "$TDESKTOP_DIR/Telegram/build/prepare/prepare.py" | awk '{ print $1 }' >> CACHE_KEY.txt
           echo "$SDK" >> CACHE_KEY.txt
+          # Libraries are built with Release variants (no skip-release), so
+          # their caches must not be mistaken for official CI's Debug-only ones.
+          echo "with-release-libs" >> CACHE_KEY.txt
           echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> "$GITHUB_ENV"
 
           echo "Configurate git for cherry-picks."
@@ -237,7 +240,9 @@ jobs:
         timeout-minutes: 290
         shell: cmd
         run: |
-          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
+          rem No skip-release (unlike official CI): we build the app in Release,
+          rem so the libraries need their Release variants too.
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
 
       # Same prune as official CI, but keep tdesktop_rust/out: its generated
       # wallet_engine.cpp is compiled by the app build (official CI's list
