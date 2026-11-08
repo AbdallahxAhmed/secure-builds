@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for wf in entinygram.yml 64gram.yml xvoard.yml keepalive.yml; do
+          for wf in entinygram.yml 64gram.yml 64gram-windows.yml 64gram-arch.yml xvoard.yml keepalive.yml; do
             gh api -X PUT "repos/$GH_REPO/actions/workflows/$wf/enable"
             echo "re-enabled $wf"
           done

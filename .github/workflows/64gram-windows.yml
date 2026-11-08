@@ -1,0 +1,521 @@
+name: 64Gram Windows
+
+# Builds the 64Gram Windows x64 installer (setup.exe) for a ref whose Linux
+# build already passed the security scan and created the release
+# `64gram-<ref>`. This workflow never scans; "release exists" is the gate.
+
+on:
+  schedule:
+    # GitHub may delay or drop scheduled runs under load, so check twice a
+    # day, off the top of the hour.
+    - cron: '5 4 * * *'
+    - cron: '35 16 * * *'
+  workflow_run:
+    workflows: [64Gram]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag to build; defaults to built_ref from state/64gram.json'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild and re-upload the setup.exe even if the release already has one'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: 64gram-windows
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Decide whether to build Windows
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      ref: ${{ steps.decide.outputs.ref }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Resolve ref and check release
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          FORCE: ${{ inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          built_ref=""
+          if [ -f state/64gram.json ]; then
+            built_ref=$(jq -r '.built_ref // ""' state/64gram.json)
+          fi
+
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref="$built_ref"
+          fi
+
+          if [ -z "$ref" ]; then
+            echo "::notice::No ref to build (no input ref and state/64gram.json has no built_ref); nothing to do"
+            exit 0
+          fi
+
+          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid ref format: $ref"
+            exit 1
+          fi
+
+          exe="64gram-${ref}-windows-x64-setup.exe"
+          if ! assets=$(gh release view "64gram-${ref}" --json assets --jq '.assets[].name'); then
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::error::Release 64gram-${ref} does not exist; the 64Gram workflow must create it first"
+              exit 1
+            fi
+            echo "::notice::Release 64gram-${ref} does not exist yet; skipping Windows build"
+            exit 0
+          fi
+
+          proceed=true
+          if [ "$FORCE" = "true" ]; then
+            echo "force=true; building $exe even if already attached to release 64gram-${ref}"
+          elif grep -Fxq "$exe" <<< "$assets"; then
+            echo "Asset $exe is already attached to release 64gram-${ref}; use force to rebuild"
+            proceed=false
+          fi
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build 64Gram (Windows x64 installer)
+    needs: decide
+    if: needs.decide.outputs.proceed == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 355
+    permissions:
+      contents: read
+    steps:
+      - name: Prepare directories
+        shell: cmd
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo REPO_NAME=tdesktop>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+          echo RELEASEPATH=%GITHUB_WORKSPACE%\TBuild\tdesktop\out\Release>>%GITHUB_ENV%
+
+      - name: Checkout 64Gram
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: TDesktop-x64/tdesktop
+          ref: ${{ needs.decide.outputs.ref }}
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: Nested submodules
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "$TDESKTOP_DIR/cmake" submodule update --init --recursive --depth=1
+
+      - name: Checkout secure-builds scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: secure-builds
+
+      - name: Apply hardening patches
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python secure-builds/scripts/harden_64gram.py "$TDESKTOP_DIR" --windows
+
+      - name: Validate API secrets
+        env:
+          API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$API_ID" =~ ^[0-9]{3,12}$ ]] || [[ ! "$API_HASH" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::TDESKTOP_API_ID/TDESKTOP_API_HASH secret missing or malformed"
+            exit 1
+          fi
+
+      # First set up, as in the official Windows workflow: parse the required
+      # Windows SDK version from docs/building-win.md, patch the CMake MSVC
+      # debug flags module, configure git for cherry-picks, and compute the
+      # libraries cache key from prepare.py + SDK version.
+      - name: First set up
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCPATH="$TDESKTOP_DIR/docs/building-win.md"
+          SDK="$(grep "SDK version" "$DOCPATH" | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          sha256sum "$TDESKTOP_DIR/Telegram/build/prepare/prepare.py" | awk '{ print $1 }' >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> "$GITHUB_ENV"
+
+          echo "Configurate git for cherry-picks."
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      - name: Native Tools Command Prompt
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: 14.44
+
+      - name: NuGet sources
+        shell: cmd
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache (restore)
+        id: tp_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}-partial-
+            ${{ runner.OS }}-${{ runner.arch }}-third-party-
+
+      - name: Libraries cache (restore)
+        id: libs_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-v2-${{ env.CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.OS }}-x64-libs-v2-${{ env.CACHE_KEY }}-partial-
+            ${{ runner.OS }}-x64-libs-v2-
+
+      - name: Qt cache (restore)
+        id: qt_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-qt-${{ env.CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.OS }}-x64-qt-${{ env.CACHE_KEY }}-partial-
+            ${{ runner.OS }}-x64-qt-
+
+      - name: Libraries
+        id: libraries
+        continue-on-error: true
+        timeout-minutes: 290
+        shell: cmd
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
+
+      - name: Free up disk space
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d "$LibrariesPath" ]; then
+            echo "No libraries directory; skipping prune"
+            exit 0
+          fi
+          find "$LibrariesPath" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+
+      # Cache entries are immutable. A partial library build (timed out or
+      # failed) is saved under a "-partial-<run id>" key so the next run
+      # resumes from it; a finished build is saved once under the exact key,
+      # and nothing is saved when the exact key was already restored. This
+      # keeps the Windows caches from crowding the repo's 10 GB cache budget.
+      - name: Choose cache save keys
+        if: always()
+        env:
+          LIBS_OUTCOME: ${{ steps.libraries.outcome }}
+          TP_HIT: ${{ steps.tp_restore.outputs.cache-hit }}
+          LIBS_HIT: ${{ steps.libs_restore.outputs.cache-hit }}
+          QT_HIT: ${{ steps.qt_restore.outputs.cache-hit }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$LIBS_OUTCOME" = "success" ]; then
+            suffix=""
+            save() { [ "$1" = "true" ] && echo false || echo true; }
+          else
+            suffix="-partial-$RUN_ID"
+            save() { echo true; }
+          fi
+          {
+            echo "CACHE_SAVE_SUFFIX=$suffix"
+            echo "SAVE_TP=$(save "$TP_HIT")"
+            echo "SAVE_LIBS=$(save "$LIBS_HIT")"
+            echo "SAVE_QT=$(save "$QT_HIT")"
+          } >> "$GITHUB_ENV"
+
+      - name: ThirdParty cache (save)
+        if: always() && env.SAVE_TP == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}${{ env.CACHE_SAVE_SUFFIX }}
+
+      - name: Libraries cache (save)
+        if: always() && env.SAVE_LIBS == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-v2-${{ env.CACHE_KEY }}${{ env.CACHE_SAVE_SUFFIX }}
+
+      - name: Qt cache (save)
+        if: always() && env.SAVE_QT == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-qt-${{ env.CACHE_KEY }}${{ env.CACHE_SAVE_SUFFIX }}
+
+      - name: Check libraries build
+        if: always()
+        env:
+          LIBS_OUTCOME: ${{ steps.libraries.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$LIBS_OUTCOME" != "success" ]; then
+            echo "::error::Libraries build did not succeed (outcome: $LIBS_OUTCOME); libraries partially built and cached; the next scheduled run resumes"
+            exit 1
+          fi
+
+      - name: Telegram Desktop build
+        if: steps.libraries.outcome == 'success'
+        env:
+          API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        shell: cmd
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat ^
+          x64 ^
+          -D CMAKE_CONFIGURATION_TYPES=Release ^
+          -D TDESKTOP_API_ID=%API_ID% ^
+          -D TDESKTOP_API_HASH=%API_HASH% ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          cmake --build ..\out --config Release --target Telegram --parallel
+
+      - name: Make sure d3dcompiler_47.dll is in ReleasePath
+        if: steps.libraries.outcome == 'success'
+        shell: cmd
+        run: |
+          setlocal enabledelayedexpansion
+          if not exist "%RELEASEPATH%\modules\x64\d3d\d3dcompiler_47.dll" (
+            set "D3DDLL="
+            if not "%WindowsSdkDir%"=="" if exist "%WindowsSdkDir%Redist\um\x64\d3dcompiler_47.dll" set "D3DDLL=%WindowsSdkDir%Redist\um\x64\d3dcompiler_47.dll"
+            if "!D3DDLL!"=="" for /r "%ProgramFiles(x86)%\Windows Kits\10" %%f in (Redist\um\x64\d3dcompiler_47.dll) do if exist "%%f" set "D3DDLL=%%f"
+            if "!D3DDLL!"=="" (echo ::error::d3dcompiler_47.dll not found in out\Release nor in the Windows SDK Redist& exit /b 1)
+            echo Copying !D3DDLL!
+            md "%RELEASEPATH%\modules\x64\d3d" 2>nul
+            copy /y "!D3DDLL!" "%RELEASEPATH%\modules\x64\d3d\d3dcompiler_47.dll"
+          )
+
+      - name: Ensure Inno Setup 6 (ISCC)
+        if: steps.libraries.outcome == 'success'
+        shell: cmd
+        run: |
+          set "ISCC="
+          for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%d\ISCC.exe" set "ISCC=%%d\ISCC.exe"
+          if "%ISCC%"=="" (
+            echo Inno Setup 6 not found; installing via Chocolatey.
+            choco install innosetup --no-progress -y
+            for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%d\ISCC.exe" set "ISCC=%%d\ISCC.exe"
+          )
+          if "%ISCC%"=="" (echo ::error::ISCC.exe not found even after installing innosetup& exit /b 1)
+          echo ISCC=%ISCC%>>%GITHUB_ENV%
+
+      - name: Prepare setup.iss (remove compiled-out Updater)
+        if: steps.libraries.outcome == 'success'
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$TDESKTOP_DIR/Telegram/build/setup.iss"
+          dest="$TDESKTOP_DIR/Telegram/build/setup.sb.iss"
+          marker='Source: "{#ReleasePath}\Updater.exe"'
+          n=$(grep -cF "$marker" "$src" || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::Expected exactly 1 Updater.exe Source line in setup.iss, found $n"
+            exit 1
+          fi
+          # Same directory keeps {#SourcePath} (SetupIconFile) valid.
+          grep -Fv "$marker" "$src" > "$dest"
+
+      - name: Read version from Telegram/build/version
+        if: steps.libraries.outcome == 'success'
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          verfile="$TDESKTOP_DIR/Telegram/build/version"
+          app_version_str_small=$(awk '$1=="AppVersionStrSmall" { print $2 }' "$verfile")
+          app_version_str=$(awk '$1=="AppVersionStr" { print $2 }' "$verfile")
+          if [ -z "$app_version_str_small" ] || [ -z "$app_version_str" ]; then
+            echo "::error::Could not read AppVersionStrSmall/AppVersionStr from $verfile"
+            exit 1
+          fi
+          echo "APP_VERSION_STR_SMALL=$app_version_str_small" >> "$GITHUB_ENV"
+          echo "APP_VERSION_STR=$app_version_str" >> "$GITHUB_ENV"
+
+      - name: Build installer
+        if: steps.libraries.outcome == 'success'
+        env:
+          REF: ${{ needs.decide.outputs.ref }}
+          OUTPUT_BASE_FILENAME: 64gram-${{ needs.decide.outputs.ref }}-windows-x64-setup
+        shell: cmd
+        run: |
+          "%ISCC%" /dMyAppVersion=%APP_VERSION_STR_SMALL% /dMyAppVersionZero=%APP_VERSION_STR% /dMyAppVersionFull=%APP_VERSION_STR% "/dReleasePath=%RELEASEPATH%" /dMyBuildTarget=win64 /dMyOutputBaseFilename=%OUTPUT_BASE_FILENAME% "%TBUILD%\%REPO_NAME%\Telegram\build\setup.sb.iss" || goto error
+          if not exist "%RELEASEPATH%\%OUTPUT_BASE_FILENAME%.exe" (
+            echo ::error::Installer exe was not produced at %RELEASEPATH%\%OUTPUT_BASE_FILENAME%.exe
+            exit /b 1
+          )
+          del "%TBUILD%\%REPO_NAME%\Telegram\build\setup.sb.iss"
+          goto end
+          :error
+          echo ::error::iscc failed
+          exit /b 1
+          :end
+          exit /b 0
+
+      - name: Stage installer artifact
+        if: steps.libraries.outcome == 'success'
+        env:
+          OUTPUT_BASE_FILENAME: 64gram-${{ needs.decide.outputs.ref }}-windows-x64-setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          relpath="$RELEASEPATH"
+          relpath="${relpath//\\//}"
+          cp "$relpath/$OUTPUT_BASE_FILENAME.exe" "dist/$OUTPUT_BASE_FILENAME.exe"
+          ls -l dist
+
+      - name: Upload Windows setup artifact
+        if: steps.libraries.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-x64-setup
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release 64Gram Windows
+    needs: [decide, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      NEW_REF: ${{ needs.decide.outputs.ref }}
+      GH_TOKEN: ${{ github.token }}
+      # No checkout in this job, so tell gh which repository to use.
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download Windows setup artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: windows-x64-setup
+          path: release_artifacts
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "release_artifacts/64gram-*.exe"
+
+      - name: Append exe sha256 to SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="64gram-${NEW_REF}-windows-x64-setup.exe"
+          sha_file="SHA256SUMS"
+
+          if [ ! -f "release_artifacts/$exe" ]; then
+            echo "::error::Missing artifact $exe"
+            exit 1
+          fi
+
+          assets=$(gh release view "64gram-${NEW_REF}" --json assets --jq '.assets[].name')
+          if grep -Fxq "$sha_file" <<< "$assets"; then
+            gh release download "64gram-${NEW_REF}" --pattern "$sha_file" --dir "$RUNNER_TEMP/sums" --clobber
+            cp "$RUNNER_TEMP/sums/$sha_file" "$sha_file"
+          else
+            echo "::notice::No existing $sha_file asset on release 64gram-${NEW_REF}; creating a new one"
+            : > "$sha_file"
+          fi
+
+          # Drop any previous line for the same file name (both `hash  name` and
+          # `hash *name` styles), then append the current one.
+          awk -v exe="$exe" 'NF==0 { print; next } { second=$2; if (second == exe || second == "*" exe) next; print }' "$sha_file" > "$sha_file.tmp"
+          mv "$sha_file.tmp" "$sha_file"
+          ( cd release_artifacts && sha256sum "$exe" ) >> "$sha_file"
+
+          gh release upload "64gram-${NEW_REF}" --clobber "release_artifacts/$exe" "$sha_file"
+
+      - name: Append Windows section to release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="64gram-${NEW_REF}-windows-x64-setup.exe"
+
+          gh release view "64gram-${NEW_REF}" --json body --jq '.body // ""' > notes.md
+          if grep -q '^### Windows' notes.md; then
+            echo "Windows section already present in release notes"
+            exit 0
+          fi
+          {
+            cat notes.md
+            echo ""
+            echo "### Windows"
+            echo "- **Windows installer**: unsigned per-user installer (\`$exe\`), no admin rights required."
+            echo "- Windows may show a SmartScreen warning: choose **More info** then **Run anyway**."
+            echo "- Verify the checksum with \`sha256sum -c SHA256SUMS\` and the build provenance with \`gh attestation verify $exe --owner ${GITHUB_REPOSITORY%/*}\`."
+          } > notes.md.new
+          mv notes.md.new notes.md
+          gh release edit "64gram-${NEW_REF}" --notes-file notes.md

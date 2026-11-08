@@ -10,6 +10,14 @@ Applies two hardening modifications:
    `"http://localhost:2468"` for radio_controller becomes `""` (exactly two
    occurrences replaced), so group-call join/leave hashes are not POSTed
    anywhere by default.
+3. With the optional `--windows` flag, in cmake/options_win.cmake the MSVC
+   linker flag `/DEPENDENTLOADFLAG:0x800` (DLL-hijacking mitigation that
+   official Telegram Desktop uses but 64Gram removed) is inserted on a new
+   line right after the `/INCREMENTAL:NO` line inside
+   `target_link_options(common_options`. Idempotent: if the flag is already
+   present anywhere in the file, nothing is changed for that file. Without
+   `--windows`, cmake/options_win.cmake is never touched (Linux CI calls
+   this script without the flag).
 
 Exit codes: 0 = success, 1 = replacement or file error, 2 = usage error.
 Python 3.12+, standard library only.
@@ -35,6 +43,11 @@ REPLACEMENT_LANGPACK = (
 TARGET_RADIO = '"http://localhost:2468"'
 REPLACEMENT_RADIO = '""'
 
+# MSVC linker flag, inserted after the anchor line in cmake/options_win.cmake.
+LINKER_FLAG = "/DEPENDENTLOADFLAG:0x800"
+TARGET_INCREMENTAL = "        /INCREMENTAL:NO"
+FLAG_LINE = "        " + LINKER_FLAG
+
 
 def find_target_file(worktree_dir: Path, rel_path: str, filename: str) -> Path:
     direct = worktree_dir / rel_path
@@ -55,7 +68,7 @@ def find_target_file(worktree_dir: Path, rel_path: str, filename: str) -> Path:
     return matches[0]
 
 
-def harden_64gram(worktree_dir: Path) -> None:
+def harden_64gram(worktree_dir: Path, windows: bool = False) -> None:
     localstorage_file = find_target_file(
         worktree_dir,
         "Telegram/SourceFiles/storage/localstorage.cpp",
@@ -78,6 +91,41 @@ def harden_64gram(worktree_dir: Path) -> None:
         raise ValueError(f"Error reading {enhanced_settings_file}: {exc}") from exc
 
     errors: list[str] = []
+
+    options_file: Path | None = None
+    options_inserted = False
+    if windows:
+        options_file = find_target_file(
+            worktree_dir,
+            "cmake/options_win.cmake",
+            "options_win.cmake",
+        )
+        try:
+            content_options = options_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Error reading {options_file}: {exc}") from exc
+
+        # Idempotent: an already patched file (flag anywhere) is left untouched.
+        if content_options.count(LINKER_FLAG) == 0:
+            count_incremental = content_options.count(TARGET_INCREMENTAL)
+            if count_incremental != 1:
+                errors.append(
+                    f"Error: anchor {TARGET_INCREMENTAL!r} found {count_incremental} "
+                    f"time(s) in {options_file} (expected exactly 1)"
+                )
+            else:
+                new_options = content_options.replace(
+                    TARGET_INCREMENTAL + "\n",
+                    TARGET_INCREMENTAL + "\n" + FLAG_LINE + "\n",
+                    1,
+                )
+                if new_options == content_options:
+                    errors.append(
+                        f"Error: anchor {TARGET_INCREMENTAL!r} in {options_file} "
+                        "is not followed by a line break; flag not inserted"
+                    )
+                else:
+                    options_inserted = True
 
     count_langpack = content_localstorage.count(TARGET_LANGPACK)
     if count_langpack != 1:
@@ -116,6 +164,16 @@ def harden_64gram(worktree_dir: Path) -> None:
     print(f"Applied replacement in {localstorage_file.name}: {TARGET_LANGPACK} -> {REPLACEMENT_LANGPACK}")
     print(f"Applied 2 replacements in {enhanced_settings_file.name}: {TARGET_RADIO} -> {REPLACEMENT_RADIO}")
 
+    if windows and options_file is not None:
+        if options_inserted:
+            try:
+                options_file.write_text(new_options, encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"Error writing {options_file}: {exc}") from exc
+            print(f"Inserted linker flag in {options_file.name}: {LINKER_FLAG}")
+        else:
+            print(f"Already present in {options_file.name}: {LINKER_FLAG}")
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -125,6 +183,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "worktree_dir",
         type=Path,
         help="path to 64Gram source tree",
+    )
+    parser.add_argument(
+        "--windows",
+        action="store_true",
+        help=(
+            "also insert the MSVC linker flag /DEPENDENTLOADFLAG:0x800 into "
+            "cmake/options_win.cmake (idempotent)"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -143,7 +209,7 @@ def main(argv: list[str]) -> int:
         return EXIT_USAGE_ERROR
 
     try:
-        harden_64gram(args.worktree_dir)
+        harden_64gram(args.worktree_dir, windows=args.windows)
     except ValueError as exc:
         print(f"harden error: {exc}", file=sys.stderr)
         return EXIT_FAILURE
