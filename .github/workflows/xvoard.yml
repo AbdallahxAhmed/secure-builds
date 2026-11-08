@@ -2,7 +2,10 @@ name: XVoard
 
 on:
   schedule:
+    # GitHub may delay or drop scheduled runs under load, so check twice a
+    # day, off the top of the hour; a run with nothing new exits in seconds.
     - cron: '17 3 * * *'
+    - cron: '43 15 * * *'
   workflow_dispatch:
     inputs:
       approve_ref:

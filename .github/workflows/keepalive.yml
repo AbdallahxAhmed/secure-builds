@@ -1,0 +1,31 @@
+name: Keep schedules alive
+
+# GitHub disables scheduled workflows in a public repository after 60 days
+# without repository activity. Months with no upstream release produce no bot
+# commits, so re-enable every scheduled workflow (this one included) through
+# the API weekly, which resets that timer without adding commits.
+on:
+  schedule:
+    - cron: '29 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  keepalive:
+    name: Re-enable scheduled workflows
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Re-enable workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          for wf in entinygram.yml 64gram.yml xvoard.yml keepalive.yml; do
+            gh api -X PUT "repos/$GH_REPO/actions/workflows/$wf/enable"
+            echo "re-enabled $wf"
+          done
