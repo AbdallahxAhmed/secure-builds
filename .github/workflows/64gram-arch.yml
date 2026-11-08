@@ -1,0 +1,217 @@
+name: 64Gram Arch package
+
+# Repackages the released, attested 64Gram Linux build into a signed pacman
+# repository served from the rolling "arch-repo" release. It never compiles
+# or audits anything itself: it only acts on a 64gram-<ref> release, which
+# exists only after the 64Gram workflow's scan gate (or a human approval).
+on:
+  workflow_run:
+    workflows: [64Gram]
+    types: [completed]
+  schedule:
+    - cron: '47 3 * * *'
+    - cron: '13 16 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '64Gram tag to package (default: built_ref in state/64gram.json)'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild even if the repo already has this version'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: 64gram-arch
+  cancel-in-progress: false
+
+env:
+  REPO_TAG: arch-repo
+  REPO_NAME: secure-builds
+  PKG_NAME: 64gram-secure
+  ARCH_IMAGE: archlinux:base-devel@sha256:2de80105abb49f813a85393c6758a4334deb6bcec4a2411bd2f059c0bee6ee4c
+  SIGNING_FPR: 5C83C78C96C437BDDD9784EA58C99BB0C15EBBA6
+
+jobs:
+  package:
+    name: Package and publish
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Decide what to package
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          FORCE: ${{ inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$INPUT_REF"
+          [ -n "$ref" ] || ref=$(jq -r '.built_ref // ""' state/64gram.json)
+          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "No valid built ref ('$ref'); nothing to package."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The gate signal: the release exists only if the scan passed or a
+          # human approved this exact ref.
+          if ! gh release view "64gram-$ref" --json tagName >/dev/null 2>&1; then
+            echo "Release 64gram-$ref does not exist (not through the gate); nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pkgver="${ref#v}"
+          pkgfile="$PKG_NAME-$pkgver-1-x86_64.pkg.tar.zst"
+          # Done means the published database lists this version (the database
+          # is uploaded last, so a half-finished publish is retried).
+          published=false
+          if gh release download "$REPO_TAG" -p "$REPO_NAME.db" -O current.db 2>/dev/null \
+              && tar -tzf current.db > current.list && grep -qxF "$PKG_NAME-$pkgver-1/" current.list; then
+            published=true
+          fi
+          if [ "$FORCE" != "true" ] && [ "$published" = true ]; then
+            echo "$pkgfile already in the repository database."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "proceed=true"
+            echo "ref=$ref"
+            echo "pkgver=$pkgver"
+            echo "pkgfile=$pkgfile"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify the release binary
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.decide.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dl work
+          tarball="64gram-$REF-linux-x86_64.tar.gz"
+          gh release download "64gram-$REF" -D dl -p "$tarball" -p SHA256SUMS
+          (cd dl && sha256sum -c --ignore-missing --strict SHA256SUMS)
+          gh attestation verify "dl/$tarball" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/64gram.yml"
+          tar -xzf "dl/$tarball" -C work Telegram
+
+      - name: Fetch desktop files and icons from the same upstream tag
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          REF: ${{ steps.decide.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/TDesktop-x64/tdesktop/$REF"
+          id=io.github.tdesktop_x64.TDesktop
+          for f in "$id.desktop" "$id.service" "$id.metainfo.xml"; do
+            curl -fsSL --proto '=https' -o "work/$f" "$base/lib/xdg/$f"
+          done
+          for s in 16 32 48 64 128 256 512; do
+            curl -fsSL --proto '=https' -o "work/icon$s.png" "$base/Telegram/Resources/art/icon$s.png"
+            file "work/icon$s.png" | grep -q 'PNG image data'
+          done
+          cp packaging/arch/PKGBUILD work/
+
+      - name: Build, sign and index the package
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          ARCH_GPG_PRIVATE_KEY: ${{ secrets.ARCH_GPG_PRIVATE_KEY }}
+          PKGVER: ${{ steps.decide.outputs.pkgver }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$ARCH_GPG_PRIVATE_KEY" ]; then
+            echo "::error::ARCH_GPG_PRIVATE_KEY secret is missing"
+            exit 1
+          fi
+          mkdir -p repo
+          # Previous repo database, so other packages in it (none today) survive.
+          gh release download "$REPO_TAG" -D repo -p "$REPO_NAME.db.tar.gz" -p "$REPO_NAME.db.tar.gz.sig" \
+            -p "$REPO_NAME.files.tar.gz" -p "$REPO_NAME.files.tar.gz.sig" 2>/dev/null || true
+          # shellcheck disable=SC2016  # expands inside the container
+          docker run --rm --network none \
+            -v "$PWD/work":/work -v "$PWD/repo":/repo \
+            -e ARCH_GPG_PRIVATE_KEY -e PKGVER -e REPO_NAME -e SIGNING_FPR -e HOST_UID="$(id -u)" \
+            "$ARCH_IMAGE" bash -euo pipefail -c '
+              useradd -m builder
+              chown -R builder /work /repo
+              # Pin the verified inputs into the PKGBUILD, then build (no network).
+              su builder -c "cd /work && sed -i -e \"s/^pkgver=.*/pkgver=$PKGVER/\" -e \"s/^sha256sums=.*/sha256sums=()/\" PKGBUILD && makepkg -g >> PKGBUILD && grep -q ^sha256sums=..[0-9a-f] PKGBUILD && makepkg --nodeps --noconfirm"
+              export GNUPGHOME=/tmp/gnupg
+              install -d -m 700 "$GNUPGHOME"
+              printf "%s" "$ARCH_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+              gpg --batch --list-secret-keys --with-colons | grep -q "fpr:::::::::$SIGNING_FPR:"
+              cd /repo
+              cp /work/*.pkg.tar.zst .
+              pkg=$(ls -1 /work/*.pkg.tar.zst | xargs -n1 basename)
+              gpg --batch --yes --local-user "$SIGNING_FPR" --detach-sign --no-armor "$pkg"
+              gpg --batch --verify "$pkg.sig" "$pkg"
+              repo-add --remove --sign --key "$SIGNING_FPR" --verify "$REPO_NAME.db.tar.gz" "$pkg"
+              # GitHub release assets cannot be symlinks: publish real copies.
+              for db in db files; do
+                cp --remove-destination "$(readlink -f "$REPO_NAME.$db.tar.gz")" "$REPO_NAME.$db"
+                cp --remove-destination "$REPO_NAME.$db.tar.gz.sig" "$REPO_NAME.$db.sig"
+              done
+              chown -R "$HOST_UID" /work /repo
+            '
+          ls -la repo
+
+      - name: Attest the package
+        if: steps.decide.outputs.proceed == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: repo/*.pkg.tar.zst
+
+      - name: Publish to the pacman repository
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.decide.outputs.ref }}
+          PKGFILE: ${{ steps.decide.outputs.pkgfile }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$REPO_TAG" >/dev/null 2>&1; then
+            {
+              echo "Signed pacman repository for Arch-based systems (Arch, CachyOS, EndeavourOS, Manjaro...)."
+              echo ""
+              echo "One-command setup (any Linux machine):"
+              echo '```'
+              echo "curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install/64gram.sh | bash"
+              echo '```'
+              echo "Signing key fingerprint: \`$SIGNING_FPR\` (public key: \`keys/arch-repo.asc\`)."
+            } > repo_notes.md
+            gh release create "$REPO_TAG" --title "Arch pacman repository" \
+              --notes-file repo_notes.md --latest=false
+          fi
+          # Package first, database last, so clients never see a database that
+          # points at a package that is not there yet.
+          gh release upload "$REPO_TAG" --clobber "repo/$PKGFILE" "repo/$PKGFILE.sig"
+          gh release upload "$REPO_TAG" --clobber \
+            "repo/$REPO_NAME.db" "repo/$REPO_NAME.db.sig" \
+            "repo/$REPO_NAME.db.tar.gz" "repo/$REPO_NAME.db.tar.gz.sig" \
+            "repo/$REPO_NAME.files" "repo/$REPO_NAME.files.sig" \
+            "repo/$REPO_NAME.files.tar.gz" "repo/$REPO_NAME.files.tar.gz.sig"
+          # Drop older versions of this package.
+          gh release view "$REPO_TAG" --json assets --jq '.assets[].name' \
+            | { grep -E "^$PKG_NAME-[0-9].*\.pkg\.tar\.zst(\.sig)?$" || true; } \
+            | { grep -vxF -e "$PKGFILE" -e "$PKGFILE.sig" || true; } \
+            | while read -r old; do gh release delete-asset "$REPO_TAG" "$old" --yes; done
+          # Also attach the package to the version's own release.
+          gh release upload "64gram-$REF" --clobber "repo/$PKGFILE" "repo/$PKGFILE.sig"

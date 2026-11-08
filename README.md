@@ -90,6 +90,25 @@ Signer #1 certificate SHA-256 digest: 4e96028c3ce915259b2a2f4af4bca7f8107dc0f9d6
 Formatted with colons:
 `4E:96:02:8C:3C:E9:15:25:9B:2A:2F:4A:F4:BC:A7:F8:10:7D:C0:F9:D6:FD:F6:05:BD:74:C7:C6:B3:54:7E:C3`
 
+## Installing 64Gram
+
+**Linux, one command (any distribution):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/AbdallahxAhmed/secure-builds/main/install/64gram.sh | bash
+```
+- On Arch-based systems (Arch, CachyOS, EndeavourOS, Manjaro...) it adds the signed `[secure-builds]`
+  pacman repository once and installs `64gram-secure`. Updates then arrive with your normal
+  `sudo pacman -Syu`. Repository signing key fingerprint:
+  `5C83C78C96C437BDDD9784EA58C99BB0C15EBBA6` (public key in `keys/arch-repo.asc`).
+- Elsewhere (or with `--user`) it installs for your user only into `~/.local`, after checking the
+  checksum (and the build attestation when the GitHub CLI is logged in). Run it again to update;
+  `--uninstall` removes it.
+
+**Windows:** download `64gram-<version>-windows-x64-setup.exe` from the release. It installs per-user
+(no admin). The installer is not code-signed, so SmartScreen asks: choose *More info* → *Run anyway*.
+Verify it first with `sha256sum -c SHA256SUMS --ignore-missing` and
+`gh attestation verify <file> --owner AbdallahxAhmed`.
+
 ## Verifying 64Gram Linux Tarballs
 
 Each 64Gram release publishes a portable tarball `64gram-<tag>-linux-x86_64.tar.gz`, `SHA256SUMS`, and a GitHub build provenance attestation.

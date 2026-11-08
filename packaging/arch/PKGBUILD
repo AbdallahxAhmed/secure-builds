@@ -1,0 +1,59 @@
+# Repackages the audited, attested 64Gram release binary from
+# github.com/AbdallahxAhmed/secure-builds into an Arch package.
+# Nothing is compiled here. .github/workflows/64gram-arch.yml stages every
+# source file next to this PKGBUILD only after verifying the tarball's build
+# provenance attestation and checksum, and fetching the desktop files and
+# icons from the same upstream tag. It also fills in pkgver.
+pkgname=64gram-secure
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="64Gram Desktop (unofficial Telegram client), audited and hardened rebuild"
+arch=(x86_64)
+url="https://github.com/AbdallahxAhmed/secure-builds"
+license=(GPL-3.0-or-later)
+depends=(desktop-file-utils glib2 hicolor-icon-theme libdbus libx11 libglvnd fontconfig)
+optdepends=('ttf-opensans: default Open Sans font family')
+provides=(64gram-desktop)
+conflicts=(64gram-desktop 64gram-desktop-bin)
+options=(!strip !debug)
+_id=io.github.tdesktop_x64.TDesktop
+source=(Telegram
+        "$_id.desktop"
+        "$_id.service"
+        "$_id.metainfo.xml"
+        icon{16,32,48,64,128,256,512}.png)
+# Inputs are verified by the workflow (attestation + SHA256SUMS + exact tag);
+# the workflow replaces this line with `makepkg -g` output before building.
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 Telegram "$pkgdir/usr/bin/64gram"
+
+  # Upstream's desktop entry runs "Telegram" and shows the Telegram icon;
+  # point it at this package's binary and 64Gram's own icon name, which is
+  # what the app asks the icon theme for (its desktop file id).
+  sed -E -e 's|^TryExec=.*|TryExec=64gram|' \
+      -e 's|^Exec=[^ ]+|Exec=/usr/bin/64gram|' \
+      -e "s|^Icon=org\.telegram\.desktop\$|Icon=$_id|" \
+      "$_id.desktop" > "$_id.desktop.out"
+  # The desktop files come from upstream's tag, not from the attested
+  # tarball, so refuse anything that would run more than our own binary.
+  if grep -E '^Exec=' "$_id.desktop.out" | grep -vqE '^Exec=/usr/bin/64gram( -- %U| -quit)?$'; then
+    echo "unexpected Exec= line in upstream desktop file" >&2; return 1
+  fi
+  install -Dm644 "$_id.desktop.out" "$pkgdir/usr/share/applications/$_id.desktop"
+
+  sed -E 's|^Exec=.*|Exec=/usr/bin/64gram|' "$_id.service" > "$_id.service.out"
+  if [ "$(grep -c . "$_id.service.out")" -ne 3 ] || ! grep -qxF "Name=$_id" "$_id.service.out"; then
+    echo "unexpected upstream D-Bus service file" >&2; return 1
+  fi
+  install -Dm644 "$_id.service.out" "$pkgdir/usr/share/dbus-1/services/$_id.service"
+
+  install -Dm644 "$_id.metainfo.xml" "$pkgdir/usr/share/metainfo/$_id.metainfo.xml"
+
+  local size
+  for size in 16 32 48 64 128 256 512; do
+    install -Dm644 "icon$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/$_id.png"
+  done
+}

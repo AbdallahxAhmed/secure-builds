@@ -21,6 +21,13 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s tests -v
 
+      - name: Run shellcheck on shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck --version | head -2
+          shellcheck install/*.sh scripts/*.sh
+
       - name: Run actionlint
         shell: bash
         run: |
