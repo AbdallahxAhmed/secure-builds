@@ -444,6 +444,60 @@ jobs:
             exit 1
           fi
 
+      # Cheap installer prerequisites run before the two-hour compile so a
+      # mistake in them fails in seconds (run 42640114125 built Telegram.exe,
+      # then died here on a cmd quoting bug). %%~d strips the for-loop quotes;
+      # with %%d, ISCC became "C:\Program Files (x86)\Inno Setup 6"\ISCC.exe
+      # and the next `if "%ISCC%"==""` failed with "Files was unexpected".
+      - name: Ensure Inno Setup 6 (ISCC)
+        if: steps.libraries.outcome == 'success'
+        shell: cmd
+        run: |
+          set "ISCC="
+          for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%~d\ISCC.exe" set "ISCC=%%~d\ISCC.exe"
+          if "%ISCC%"=="" (
+            echo Inno Setup 6 not found; installing via Chocolatey.
+            choco install innosetup --no-progress -y
+            for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%~d\ISCC.exe" set "ISCC=%%~d\ISCC.exe"
+          )
+          if "%ISCC%"=="" (echo ::error::ISCC.exe not found even after installing innosetup& exit /b 1)
+          echo ISCC=%ISCC%>>%GITHUB_ENV%
+
+      - name: Prepare setup.iss (remove compiled-out Updater)
+        if: steps.libraries.outcome == 'success'
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$TDESKTOP_DIR/Telegram/build/setup.iss"
+          dest="$TDESKTOP_DIR/Telegram/build/setup.sb.iss"
+          marker='Source: "{#ReleasePath}\Updater.exe"'
+          n=$(grep -cF "$marker" "$src" || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::Expected exactly 1 Updater.exe Source line in setup.iss, found $n"
+            exit 1
+          fi
+          # Same directory keeps {#SourcePath} (SetupIconFile) valid.
+          grep -Fv "$marker" "$src" > "$dest"
+
+      - name: Read version from Telegram/build/version
+        if: steps.libraries.outcome == 'success'
+        env:
+          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          verfile="$TDESKTOP_DIR/Telegram/build/version"
+          app_version_str_small=$(awk '$1=="AppVersionStrSmall" { print $2 }' "$verfile")
+          app_version_str=$(awk '$1=="AppVersionStr" { print $2 }' "$verfile")
+          if [ -z "$app_version_str_small" ] || [ -z "$app_version_str" ]; then
+            echo "::error::Could not read AppVersionStrSmall/AppVersionStr from $verfile"
+            exit 1
+          fi
+          echo "APP_VERSION_STR_SMALL=$app_version_str_small" >> "$GITHUB_ENV"
+          echo "APP_VERSION_STR=$app_version_str" >> "$GITHUB_ENV"
+
       # Diagnostic: a detached background monitor samples every cl.exe's
       # private memory (with the .cpp it is compiling) every 30 s into
       # %RUNNER_TEMP%\memlog.txt, so we finally get per-file data on which
@@ -607,55 +661,6 @@ jobs:
             md "%RELEASEPATH%\modules\x64\d3d" 2>nul
             copy /y "!D3DDLL!" "%RELEASEPATH%\modules\x64\d3d\d3dcompiler_47.dll"
           )
-
-      - name: Ensure Inno Setup 6 (ISCC)
-        if: steps.libraries.outcome == 'success'
-        shell: cmd
-        run: |
-          set "ISCC="
-          for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%d\ISCC.exe" set "ISCC=%%d\ISCC.exe"
-          if "%ISCC%"=="" (
-            echo Inno Setup 6 not found; installing via Chocolatey.
-            choco install innosetup --no-progress -y
-            for %%d in ("%ProgramFiles(x86)%\Inno Setup 6" "%ProgramFiles%\Inno Setup 6") do if exist "%%d\ISCC.exe" set "ISCC=%%d\ISCC.exe"
-          )
-          if "%ISCC%"=="" (echo ::error::ISCC.exe not found even after installing innosetup& exit /b 1)
-          echo ISCC=%ISCC%>>%GITHUB_ENV%
-
-      - name: Prepare setup.iss (remove compiled-out Updater)
-        if: steps.libraries.outcome == 'success'
-        env:
-          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          src="$TDESKTOP_DIR/Telegram/build/setup.iss"
-          dest="$TDESKTOP_DIR/Telegram/build/setup.sb.iss"
-          marker='Source: "{#ReleasePath}\Updater.exe"'
-          n=$(grep -cF "$marker" "$src" || true)
-          if [ "$n" -ne 1 ]; then
-            echo "::error::Expected exactly 1 Updater.exe Source line in setup.iss, found $n"
-            exit 1
-          fi
-          # Same directory keeps {#SourcePath} (SetupIconFile) valid.
-          grep -Fv "$marker" "$src" > "$dest"
-
-      - name: Read version from Telegram/build/version
-        if: steps.libraries.outcome == 'success'
-        env:
-          TDESKTOP_DIR: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          verfile="$TDESKTOP_DIR/Telegram/build/version"
-          app_version_str_small=$(awk '$1=="AppVersionStrSmall" { print $2 }' "$verfile")
-          app_version_str=$(awk '$1=="AppVersionStr" { print $2 }' "$verfile")
-          if [ -z "$app_version_str_small" ] || [ -z "$app_version_str" ]; then
-            echo "::error::Could not read AppVersionStrSmall/AppVersionStr from $verfile"
-            exit 1
-          fi
-          echo "APP_VERSION_STR_SMALL=$app_version_str_small" >> "$GITHUB_ENV"
-          echo "APP_VERSION_STR=$app_version_str" >> "$GITHUB_ENV"
 
       - name: Build installer
         if: steps.libraries.outcome == 'success'
