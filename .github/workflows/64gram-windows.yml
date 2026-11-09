@@ -461,7 +461,11 @@ jobs:
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 
-          cmake --build ..\out --config Release --target Telegram --parallel
+          rem A full-speed Release compile (/MP, one cl.exe per core) can run the
+          rem 16 GB runner out of memory on a few huge sources (C1060 "compiler is
+          rem out of heap space"). The build is incremental, so on failure finish
+          rem the remaining files one at a time instead of starting over.
+          cmake --build ..\out --config Release --target Telegram --parallel || cmake --build ..\out --config Release --target Telegram -- /m:1 /p:CL_MPCount=1
 
       # Diagnostic: how full the disks are right after the app build;
       # must never fail.
