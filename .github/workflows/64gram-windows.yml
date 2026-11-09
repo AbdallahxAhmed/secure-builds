@@ -444,8 +444,61 @@ jobs:
             exit 1
           fi
 
+      # Diagnostic: a detached background monitor samples every cl.exe's
+      # private memory (with the .cpp it is compiling) every 30 s into
+      # %RUNNER_TEMP%\memlog.txt, so we finally get per-file data on which
+      # settings sources ran the compiler out of heap space (C1060) or pushed
+      # the 16 GB runner into commit-limit thrash. It keeps writing while the
+      # build step below is being killed by its timeout; the runner kills it
+      # only when the job ends.
+      - name: Start memory monitor
+        if: steps.libraries.outcome == 'success'
+        shell: pwsh
+        run: |
+          # Written as an array of single-quoted lines instead of a
+          # here-string: a here-string terminator would need to sit flush
+          # left, which an indented workflow run block can never give it.
+          $monitor = Join-Path $env:RUNNER_TEMP 'memmon.ps1'
+          $lines = @(
+            '$log = Join-Path $env:RUNNER_TEMP "memlog.txt"'
+            'while ($true) {'
+            '  try {'
+            '    $os = Get-CimInstance Win32_OperatingSystem'
+            '    $freePhys = [double]$os.FreePhysicalMemory / 1MB'
+            '    $committed = ([double]$os.TotalVirtualMemorySize - [double]$os.FreeVirtualMemory) / 1MB'
+            '    $limit = [double]$os.TotalVirtualMemorySize / 1MB'
+            '    $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")'
+            '    $block = New-Object System.Collections.Generic.List[string]'
+            '    $block.Add("{0} freePhys={1:N1}GB committed={2:N1}GB limit={3:N1}GB" -f $stamp, $freePhys, $committed, $limit)'
+            '    $cls = @(Get-CimInstance Win32_Process -Filter "Name=''cl.exe''" | Sort-Object PrivatePageCount -Descending | Select-Object -First 8)'
+            '    foreach ($cl in $cls) {'
+            '      $cmdLine = [string]$cl.CommandLine'
+            '      $names = [regex]::Matches($cmdLine, "[\w.+-]+\.(cpp|cxx|cc|c)\b") | ForEach-Object { $_.Value } | Select-Object -Unique'
+            '      $src = [string]::Join(",", @($names))'
+            '      if (-not $src) { $src = $cmdLine.Substring(0, [Math]::Min(200, $cmdLine.Length)) }'
+            '      $age = ((Get-Date) - $cl.CreationDate).TotalMinutes'
+            '      $block.Add("  pid={0} priv={1:N2}GB age={2:N1}min src={3}" -f $cl.ProcessId, ([double]$cl.PrivatePageCount / 1GB), $age, $src)'
+            '    }'
+            '    Add-Content -Path $log -Encoding utf8 -Value ($block -join [Environment]::NewLine)'
+            '  } catch {'
+            '    try { Add-Content -Path $log -Encoding utf8 -Value ("  sample failed: {0}" -f $_) } catch { }'
+            '  }'
+            '  Start-Sleep -Seconds 30'
+            '}'
+          )
+          Set-Content -Path $monitor -Encoding utf8 -Value ($lines -join [Environment]::NewLine)
+          # One bad sample must never kill the monitor: its whole loop body is
+          # wrapped in try/catch inside the script above.
+          Start-Process pwsh -ArgumentList '-NoProfile','-File',$monitor -WindowStyle Hidden
+          Write-Host ('Memory monitor started; log: {0}' -f (Join-Path $env:RUNNER_TEMP 'memlog.txt'))
+          exit 0
+
       - name: Telegram Desktop build
         if: steps.libraries.outcome == 'success'
+        # The job timeout once killed the whole run mid-build with no
+        # diagnostics; kill only this step at 300 minutes and let the
+        # diagnostic steps below summarize the monitor log.
+        timeout-minutes: 300
         env:
           API_ID: ${{ secrets.TDESKTOP_API_ID }}
           API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
@@ -461,11 +514,12 @@ jobs:
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 
-          rem A full-speed Release compile (/MP, one cl.exe per core) can run the
-          rem 16 GB runner out of memory on a few huge sources (C1060 "compiler is
-          rem out of heap space"). The build is incremental, so on failure finish
-          rem the remaining files one at a time instead of starting over.
-          cmake --build ..\out --config Release --target Telegram --parallel || cmake --build ..\out --config Release --target Telegram -- /m:1 /p:CL_MPCount=1
+          rem Starts with two compiles at a time because four at a time (/MP,
+          rem one cl.exe per core) ran the 16 GB runner out of memory on the
+          rem settings sources (C1060 "compiler is out of heap space"). The
+          rem build is incremental, so if it still fails finish the remaining
+          rem files one at a time instead of starting over.
+          cmake --build ..\out --config Release --target Telegram --parallel -- /p:CL_MPCount=2 || cmake --build ..\out --config Release --target Telegram -- /m:1 /p:CL_MPCount=1
 
       # Diagnostic: how full the disks are right after the app build;
       # must never fail.
@@ -481,6 +535,57 @@ jobs:
             Write-Host ('Disk space probe failed: {0}' -f $_)
           }
           exit 0
+
+      # Diagnostic: stop the monitor and summarize %RUNNER_TEMP%\memlog.txt
+      # while the run is alive (worst cl.exe lines, one per distinct src with
+      # its peak private memory, then the log tail), so even a timeout-killed
+      # build still shows which settings sources caused C1060/commit-limit
+      # thrash. Must never fail; the raw log is attached by the next step.
+      - name: Memory monitor report
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $log = Join-Path $env:RUNNER_TEMP 'memlog.txt'
+            if (Test-Path -LiteralPath $log) {
+              Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" |
+                Where-Object CommandLine -like '*memmon.ps1*' |
+                Invoke-CimMethod -MethodName Terminate
+              $lines = @(Get-Content -LiteralPath $log)
+              Write-Host ('memlog.txt: {0} lines' -f $lines.Count)
+              $best = @{}
+              foreach ($line in $lines) {
+                if ($line -notmatch 'priv=([0-9.]+)GB') { continue }
+                $priv = [double]$Matches[1]
+                $src = if ($line -match ' src=(.*)$') { $Matches[1] } else { '<no src>' }
+                $prev = $best[$src]
+                if (-not $prev -or $priv -gt $prev.priv) {
+                  $best[$src] = [pscustomobject]@{ priv = $priv; line = $line }
+                }
+              }
+              Write-Host 'Top 25 cl.exe samples by private memory (actual line per src, max priv kept):'
+              $best.Values | Sort-Object priv -Descending | Select-Object -First 25 | ForEach-Object { Write-Host $_.line }
+              Write-Host 'Last 60 lines of memlog.txt:'
+              $lines | Select-Object -Last 60 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host ('No {0}; the monitor never produced a sample' -f $log)
+            }
+          } catch {
+            Write-Host ('Memory monitor report failed: {0}' -f $_)
+          }
+          exit 0
+
+      # Attach the raw memlog.txt as an artifact: a full diagnosis must also
+      # survive a timed-out job, not only its final report above (same pinned
+      # upload action as the setup artifact in this job).
+      - name: Upload memory log
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: memlog
+          path: ${{ runner.temp }}/memlog.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Make sure d3dcompiler_47.dll is in ReleasePath
         if: steps.libraries.outcome == 'success'
