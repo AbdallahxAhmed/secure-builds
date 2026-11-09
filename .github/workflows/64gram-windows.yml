@@ -469,7 +469,7 @@ jobs:
             '    $limit = [double]$os.TotalVirtualMemorySize / 1MB'
             '    $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")'
             '    $block = New-Object System.Collections.Generic.List[string]'
-            '    $block.Add("{0} freePhys={1:N1}GB committed={2:N1}GB limit={3:N1}GB" -f $stamp, $freePhys, $committed, $limit)'
+            '    $block.Add(("{0} freePhys={1:N1}GB committed={2:N1}GB limit={3:N1}GB" -f $stamp, $freePhys, $committed, $limit))'
             '    $cls = @(Get-CimInstance Win32_Process -Filter "Name=''cl.exe''" | Sort-Object PrivatePageCount -Descending | Select-Object -First 8)'
             '    foreach ($cl in $cls) {'
             '      $cmdLine = [string]$cl.CommandLine'
@@ -477,7 +477,7 @@ jobs:
             '      $src = [string]::Join(",", @($names))'
             '      if (-not $src) { $src = $cmdLine.Substring(0, [Math]::Min(200, $cmdLine.Length)) }'
             '      $age = ((Get-Date) - $cl.CreationDate).TotalMinutes'
-            '      $block.Add("  pid={0} priv={1:N2}GB age={2:N1}min src={3}" -f $cl.ProcessId, ([double]$cl.PrivatePageCount / 1GB), $age, $src)'
+            '      $block.Add(("  pid={0} priv={1:N2}GB age={2:N1}min src={3}" -f $cl.ProcessId, ([double]$cl.PrivatePageCount / 1GB), $age, $src))'
             '    }'
             '    Add-Content -Path $log -Encoding utf8 -Value ($block -join [Environment]::NewLine)'
             '  } catch {'
@@ -506,13 +506,19 @@ jobs:
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
 
+          rem cmake_helpers defaults Release to embedded debug info (/Z7) and a
+          rem full PDB link; on the 16 GB runner that ran cl.exe (C1060) and the
+          rem final link (LNK1102) out of memory. Crash reports are disabled, so
+          rem no PDB is shipped: an empty format turns /Z7 off and links with
+          rem /DEBUG:NONE (options_win.cmake keys off this property).
           call configure.bat ^
           x64 ^
           -D CMAKE_CONFIGURATION_TYPES=Release ^
           -D TDESKTOP_API_ID=%API_ID% ^
           -D TDESKTOP_API_HASH=%API_HASH% ^
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
-          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT:STRING=
 
           rem Starts with two compiles at a time because four at a time (/MP,
           rem one cl.exe per core) ran the 16 GB runner out of memory on the
